@@ -1,0 +1,7 @@
+This is file with random content for testing purposes.
+
+That function works fine. However, I would like to be able to test the code but 
+don't want my tests to actually create real files. Tests sometimes crash, after 
+all, and it's a pain to ensure that tests always clean up after themselves. It's 
+also no fun to debug unreliable test automation because the box ran out of 
+scratch space due to tests leaking temporary files.

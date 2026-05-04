@@ -1,0 +1,27 @@
+# Rust build output
+/target/
+
+# Generated crawler output
+/static/
+/clippy.out
+
+# Editor and IDE metadata
+/.vscode/
+/.idea/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp

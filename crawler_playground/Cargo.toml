@@ -1,0 +1,33 @@
+[package]
+name = "crawler_playground"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+reqwest = { version = "0.11.22", features = ["blocking", "json"] }
+select = "0.6.0"
+rayon = { version = "1.8.0" }
+#optional HTML parser
+scraper = "0.18.1"
+prettytable-rs = "0.10.0"
+
+[[bin]]
+name = "crawler_playground"
+path = "src/main.rs"
+
+[[bin]]
+name = "crawler_playground_concurrent"
+path = "src/crawler_plgrd_concurr.rs"
+
+[[bin]]
+name = "crawler_snippets"
+path = "src/snippets.rs"
+
+[[bin]]
+name = "imdb_web_scraper"
+path = "src/imdb_scrapper.rs"
+
+[[bin]]
+name = "hackernews_scraper"
+path = "src/hacker_news_scrapper.rs"
+

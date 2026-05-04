@@ -1,0 +1,18 @@
+# virtual workspace for all packages
+# No [package] section in this root Cargo.toml
+[workspace]
+
+# add projects to the workspace
+members = [
+    "web_crawler", 
+    "wiki_crawler", 
+    "crawler_playground",
+    "concurrency_pattern",
+    "web_crawler_blackhat"
+]
+
+# see the Cargo book for dependency resolution
+# resolver version must be explicitly set
+# for virtual workspaces
+resolver = "2"
+
