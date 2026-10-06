@@ -25,7 +25,6 @@ async fn main() -> Result<(), anyhow::Error> {
                     .short('s')
                     .long("spider")
                     .help("The spider to run")
-                    .takes_value(true)
                     .required(true),
             ),
         )
@@ -42,7 +41,10 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     } else if let Some(matches) = cli.subcommand_matches("run") {
         // we can safely unwrap as the argument is required
-        let spider_name = matches.value_of("spider").unwrap();
+        let spider_name = matches
+            .get_one::<String>("spider")
+            .expect("spider argument is required")
+            .as_str();
         let crawler = Crawler::new(Duration::from_millis(200), 2, 500);
 
         match spider_name {

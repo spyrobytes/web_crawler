@@ -16,7 +16,10 @@ impl QuotesSpider {
         let mut caps = serde_json::map::Map::new();
         let chrome_opts = serde_json::json!({ "args": ["--headless", "--disable-gpu"] });
         caps.insert("goog:chromeOptions".to_string(), chrome_opts);
-        let webdriver_client = ClientBuilder::rustls()
+        // fantoccini 0.20+ returns a Result here because building the
+        // rustls connector can fail.
+        let mut builder = ClientBuilder::rustls().map_err(|err| Error::WebDriver(err.to_string()))?;
+        let webdriver_client = builder
             .capabilities(caps)
             .connect("http://localhost:4444")
             .await?;
