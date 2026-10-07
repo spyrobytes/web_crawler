@@ -1,4 +1,5 @@
 use crate::error::Error;
+use crate::links;
 use async_trait::async_trait;
 use fantoccini::{Client, ClientBuilder};
 use select::{
@@ -9,10 +10,16 @@ use select::{
 use tokio::sync::Mutex;
 
 pub struct QuotesSpider {
+    // One browser session behind an async mutex: `goto` and `source` must not
+    // interleave, so scrapes are serialised and this spider's effective
+    // crawling concurrency is one regardless of the crawler's setting. A pool
+    // of sessions would lift that; not worth it for a demo site.
     webdriver_client: Mutex<Client>,
 }
 
 impl QuotesSpider {
+    pub const NAME: &'static str = "quotes";
+
     pub async fn new() -> Result<Self, Error> {
         let mut caps = serde_json::map::Map::new();
         let chrome_opts = serde_json::json!({ "args": ["--headless", "--disable-gpu"] });
@@ -43,7 +50,7 @@ impl super::Spider for QuotesSpider {
     type Item = QuotesItem;
 
     fn name(&self) -> String {
-        String::from("quotes")
+        String::from(Self::NAME)
     }
 
     fn start_urls(&self) -> Vec<String> {
@@ -59,6 +66,13 @@ impl super::Spider for QuotesSpider {
         };
 
         let document = Document::from(html.as_str());
+
+        if document.find(Class("quote")).next().is_none() {
+            return Err(Error::parse(
+                &url,
+                "no .quote blocks found; the site may have changed its markup",
+            ));
+        }
 
         for quote in document.find(Class("quote")) {
             // A single odd block should not cost us the rest of the page, so
@@ -76,7 +90,7 @@ impl super::Spider for QuotesSpider {
                     .descendant(Name("a")),
             )
             .filter_map(|n| n.attr("href"))
-            .map(|url| self.normalize_url(url))
+            .filter_map(|href| links::resolve(&url, href))
             .collect::<Vec<String>>();
 
         Ok((items, next_pages_link))
@@ -100,30 +114,18 @@ fn parse_quote(url: &str, quote: Node<'_>) -> Result<QuotesItem, Error> {
     let quote_str = spans
         .next()
         .map(|span| span.text().trim().to_string())
-        .ok_or_else(|| Error::Internal(format!("{url}: quote block has no text span")))?;
+        .ok_or_else(|| Error::parse(url, "quote block has no text span"))?;
 
     let author = spans
         .next()
         .and_then(|span| span.find(Class("author")).next())
         .map(|node| node.text().trim().to_string())
-        .ok_or_else(|| Error::Internal(format!("{url}: quote block has no author")))?;
+        .ok_or_else(|| Error::parse(url, "quote block has no author"))?;
 
     Ok(QuotesItem {
         quote: quote_str,
         author,
     })
-}
-
-impl QuotesSpider {
-    fn normalize_url(&self, url: &str) -> String {
-        let url = url.trim();
-
-        if url.starts_with('/') {
-            return format!("https://quotes.toscrape.com{}", url);
-        }
-
-        url.to_string()
-    }
 }
 
 #[cfg(test)]

@@ -50,6 +50,9 @@ pub struct CrawlStats {
     pub frontier_remaining: usize,
     /// Pages whose `scrape` returned `Ok`.
     pub pages_scraped: usize,
+    /// Pages whose `scrape` returned `Ok` with no items and no links. Normal
+    /// for leaf pages; suspicious when it is every page.
+    pub empty_pages: usize,
     /// Pages whose `scrape` returned `Err` (logged at the time).
     pub scrape_errors: usize,
     /// Items whose `process` returned `Ok`.
@@ -68,8 +71,12 @@ impl fmt::Display for CrawlStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "pages scraped: {}, scrape errors: {}, items processed: {}, processing errors: {}",
-            self.pages_scraped, self.scrape_errors, self.items_processed, self.process_errors
+            "pages scraped: {} ({} empty), scrape errors: {}, items processed: {}, processing errors: {}",
+            self.pages_scraped,
+            self.empty_pages,
+            self.scrape_errors,
+            self.items_processed,
+            self.process_errors
         )?;
         if let Some(reason) = self.stop_reason {
             write!(
@@ -89,6 +96,7 @@ impl fmt::Display for CrawlStats {
 #[derive(Default)]
 struct ScraperTally {
     pages_scraped: AtomicUsize,
+    empty_pages: AtomicUsize,
     scrape_errors: AtomicUsize,
 }
 
@@ -298,6 +306,7 @@ impl Crawler {
             stop_reason,
             frontier_remaining: frontier.len(),
             pages_scraped: scraper_tally.pages_scraped.into_inner(),
+            empty_pages: scraper_tally.empty_pages.into_inner(),
             scrape_errors: scraper_tally.scrape_errors.into_inner(),
             items_processed: processor_tally.items_processed.into_inner(),
             process_errors: processor_tally.process_errors.into_inner(),
@@ -370,6 +379,9 @@ impl Crawler {
                     match spider.scrape(queued_url.clone()).await {
                         Ok((items, new_urls)) => {
                             tally.pages_scraped.fetch_add(1, Ordering::Relaxed);
+                            if items.is_empty() && new_urls.is_empty() {
+                                tally.empty_pages.fetch_add(1, Ordering::Relaxed);
+                            }
                             for item in items {
                                 // A failed send means the processor task is
                                 // gone, which the join handle reports; there
@@ -379,7 +391,15 @@ impl Crawler {
                             urls = new_urls;
                         }
                         Err(err) => {
-                            log::error!("{spider_name}: scraping {queued_url} failed: {err}");
+                            // Nothing retries yet (that is the politeness
+                            // work), but the log should already say which
+                            // failures would have been worth it.
+                            let hint = if err.is_retryable() {
+                                " (retryable)"
+                            } else {
+                                ""
+                            };
+                            log::error!("{spider_name}: scraping {queued_url} failed{hint}: {err}");
                             tally.scrape_errors.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -661,12 +681,13 @@ mod tests {
         let dyn_spider: Arc<dyn Spider<Item = ()>> = spider.clone();
         let crawler = Crawler::new(Duration::from_millis(0), 2, 1);
 
-        tokio::time::timeout(Duration::from_secs(5), crawler.run(dyn_spider))
+        let stats = tokio::time::timeout(Duration::from_secs(5), crawler.run(dyn_spider))
             .await
             .expect("crawler should finish instead of deadlocking")
             .expect("a well-behaved spider should not produce an error");
 
         assert_eq!(spider.scraped.load(Ordering::SeqCst), 1_701);
+        assert_eq!(stats.empty_pages, 1_700, "every leaf is an empty page");
     }
 
     // A frontier that never runs dry: every page links to the next one and

@@ -4,15 +4,24 @@
  *
  */
 use clap::{Arg, Command};
-use std::{env, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 mod crawler;
 mod error;
+mod links;
 mod spiders;
 
 use crate::crawler::{Crawler, StopReason};
+use crate::spiders::{cvedetails::CveDetailsSpider, github::GitHubSpider, quotes::QuotesSpider};
 use error::Error;
 use tokio_util::sync::CancellationToken;
+
+// One list, derived from each spider's own `NAME`, drives both subcommands.
+const SPIDER_NAMES: &[&str] = &[
+    CveDetailsSpider::NAME,
+    GitHubSpider::NAME,
+    QuotesSpider::NAME,
+];
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -40,13 +49,13 @@ async fn main() -> Result<(), anyhow::Error> {
         .arg_required_else_help(true)
         .get_matches();
 
-    env::set_var("RUST_LOG", "info,crawler=debug");
-    env_logger::init();
+    // `info` unless the user says otherwise. Setting RUST_LOG from inside
+    // the program would make the environment variable a no-op.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     if cli.subcommand_matches("spiders").is_some() {
-        let spider_names = vec!["cvedetails", "github", "quotes"];
-        for name in spider_names {
-            println!("{}", name);
+        for name in SPIDER_NAMES {
+            println!("{name}");
         }
     } else if let Some(matches) = cli.subcommand_matches("run") {
         // we can safely unwrap as the argument is required
@@ -64,19 +73,9 @@ async fn main() -> Result<(), anyhow::Error> {
             .with_cancellation(cancellation);
 
         let stats = match spider_name {
-            "cvedetails" => {
-                let spider = Arc::new(spiders::cvedetails::CveDetailsSpider::new());
-                crawler.run(spider).await?
-            }
-            "github" => {
-                let spider = Arc::new(spiders::github::GitHubSpider::new());
-                crawler.run(spider).await?
-            }
-            "quotes" => {
-                let spider = spiders::quotes::QuotesSpider::new().await?;
-                let spider = Arc::new(spider);
-                crawler.run(spider).await?
-            }
+            CveDetailsSpider::NAME => crawler.run(Arc::new(CveDetailsSpider::new())).await?,
+            GitHubSpider::NAME => crawler.run(Arc::new(GitHubSpider::new())).await?,
+            QuotesSpider::NAME => crawler.run(Arc::new(QuotesSpider::new().await?)).await?,
             _ => return Err(Error::InvalidSpider(spider_name.to_string()).into()),
         };
 
