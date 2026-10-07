@@ -87,31 +87,42 @@ own HTTP or WebDriver client and their own URL normalisation. The crawler never
 looks inside an item; it is generic over `T` and holds `Arc<dyn Spider<Item = T>>`.
 
 **`Crawler::run`** (`crawler.rs`) wires three parties together with three
-bounded mpsc channels and a three-party `Barrier`:
+bounded mpsc channels:
 
 - The **scraper task**: a `ReceiverStream` over `urls_to_visit`, driven by
-  `for_each_concurrent(crawling_concurrency)`. Each scrape increments an
-  `active_spiders` counter, sends items into `items_tx`, reports
-  `(visited_url, new_urls)` into `new_urls_tx`, sleeps `delay`, then decrements.
+  `for_each_concurrent(crawling_concurrency)`. Each scrape sends items into
+  `items_tx`, then sends exactly one `(visited_url, new_urls)` report into
+  `new_urls_tx` whether it succeeded or not, then sleeps `delay`. The task
+  owns the only `new_urls` sender.
 - The **processor task**: a `ReceiverStream` over `items`, driven by
   `for_each_concurrent(processing_concurrency)`, calling `spider.process`.
-- The **control loop** (runs inline in `run`): the only owner of the
-  `visited_urls` set. It drains `new_urls_rx`, dedupes, and pushes unseen URLs
-  into `urls_to_visit_tx`. It exits when both URL channels are empty **and**
-  `active_spiders == 0`, then drops `urls_to_visit_tx`, which ends the scraper
-  stream, which drops `items_tx`, which ends the processor stream. All three
-  then meet at the barrier.
+- The **control loop** (runs inline in `run`): the sole owner of the
+  `visited_urls` set, a `VecDeque` frontier, and an `outstanding` count of
+  URLs handed over but not yet reported. Each turn is a `tokio::select!`
+  between a report arriving and `urls_to_visit_tx.reserve()` finding room
+  (that branch only enabled while the frontier is non-empty). It exits when
+  the frontier is empty and nothing is outstanding, or when `new_urls`
+  closes, which can only mean the scraper task died. It then drops
+  `urls_to_visit_tx`, which ends the scraper stream, which drops `items_tx`,
+  which ends the processor stream. `run` awaits both join handles, always
+  both, and turns a `JoinError` into `Error::Internal`.
 
 Consequences worth knowing before touching it:
 
 - Dedup lives only in the control loop. Spiders may emit duplicates freely.
+- The control loop must never block on a send. `urls_to_visit` and `new_urls`
+  form a cycle; a loop that blocked on a full `urls_to_visit` would stop
+  draining `new_urls`, scrapers would then block on their reports, and the
+  crawl would deadlock (one page with more than twice the channel capacity in
+  unseen links was enough). `reserve()` inside `select!` is what prevents it.
 - The per-request `delay` sits inside the concurrency slot, so throughput is
   bounded by `crawling_concurrency / delay`, not by the number of URLs.
 - A panic inside `scrape` or `process` does **not** crash the process. Tokio
-  catches it at the task boundary, the whole scraper (or processor) task is
-  dropped, the counter is never decremented, and the control loop waits
-  forever. That is why spiders must return `Error` rather than unwrap, and why
-  objective 1 exists.
+  catches it at the task boundary and the whole scraper (or processor) task is
+  dropped. The crawler now survives that (channel closure ends the loop, the
+  join handle reports the panic, `run` returns an error), but spiders should
+  still return `Error` rather than unwrap so one bad page costs one page, not
+  the crawl.
 - Scrape errors are logged in `crawler.rs` and the URL is reported as visited
   with no children. Returning an error from `scrape` therefore skips that page
   and its pagination; the spiders instead skip individual bad rows inside

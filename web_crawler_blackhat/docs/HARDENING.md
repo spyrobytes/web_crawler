@@ -7,10 +7,13 @@ and the fix. Status: **done**, **in progress**, or **open**.
 
 ## Control loop and shutdown (`crawler.rs`)
 
-1. **Active-spider count not paired with its decrement.** `done` (29a41a6)
+1. **Active-spider count not paired with its decrement.** `done` (29a41a6, then superseded)
    The increment and decrement were two statements. A panic or an early drop of
    the per-URL future skipped the decrement and the control loop waited
-   forever. Fixed with `ActiveSpiderGuard`, which decrements in `Drop`.
+   forever. First fixed with `ActiveSpiderGuard`, which decrements in `Drop`.
+   The control-loop rewrite for item 5 then removed the shared counter
+   altogether: the loop counts URLs from hand-over to report, and a dead
+   scraper task is detected by the `new_urls` channel closing.
 
 2. **Shutdown waits on a barrier that a dead task never reaches.** `done`
    `Barrier::new(3)` assumes all three parties arrive. A task that panicked is
@@ -25,28 +28,29 @@ and the fix. Status: **done**, **in progress**, or **open**.
    zero. `run` now returns `Result<(), Error>` and `main` propagates it with `?`.
 
 4. **Termination check can fire while a URL is between the channel and its
-   guard.** `open`
+   guard.** `done`
    A URL leaves `urls_to_visit` (restoring the channel's capacity) slightly
    before its `ActiveSpiderGuard` exists. The control loop, on another worker
    thread, can observe "channels empty, count zero" in that gap and exit early.
-   Fix: count a URL as outstanding when the control loop enqueues it and
-   release it when the scraper reports back, so the count never dips during
-   the hand-off.
+   Fixed with item 5: `outstanding` is incremented when the control loop
+   hands a URL over and decremented when the report arrives, so the count
+   never dips during the hand-off.
 
-5. **Bounded channels in a cycle can deadlock.** `open`
+5. **Bounded channels in a cycle can deadlock.** `done`
    The control loop blocks on `urls_to_visit_tx.send(..).await` when that
    channel is full, and while blocked it does not drain `new_urls_rx`. Scrapers
    block on `new_urls_tx.send(..).await` when that fills. Once both are full
    nobody moves. With capacity 800 and pages that link to ~100 new URLs each,
-   this is reachable on a real site within seconds. Fix: the control loop
-   must never block on a send; keep its own unbounded `VecDeque` of pending
-   URLs and feed the channel only when there is capacity (`try_send` or a
-   `select!` over recv and send).
+   this is reachable on a real site within seconds; a single page with more
+   than 1,600 unseen links was enough. Fixed: the control loop owns a
+   `VecDeque` frontier and uses `select!` over `new_urls_rx.recv()` and
+   `urls_to_visit_tx.reserve()`, so it never blocks on a send. Covered by
+   `run_survives_a_page_with_more_links_than_the_channels_hold`.
 
-6. **Control loop polls instead of awaiting.** `open`
+6. **Control loop polls instead of awaiting.** `done`
    `try_recv` followed by `sleep(5ms)` wakes two hundred times a second doing
-   nothing. Fix folds into item 5: `select!` over `new_urls_rx.recv()` and the
-   pending send, with the termination check after each event.
+   nothing. Fixed with item 5: the loop now sleeps inside `select!` until a
+   report arrives or channel capacity frees up.
 
 7. **No way to stop a crawl.** `open`
    There is no cancellation token, no page limit, and no Ctrl-C handling. A
