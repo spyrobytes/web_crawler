@@ -61,12 +61,15 @@ cargo fmt -p web_crawler_blackhat -- --check   # several files still have pre-ex
 
 cargo run -p web_crawler_blackhat -- spiders                 # list spiders
 cargo run -p web_crawler_blackhat -- run --spider github     # the one that reliably works live
+cargo run -p web_crawler_blackhat -- run --spider github --max-pages 2
 ```
 
 Runtime notes:
 
 - `main.rs` sets `RUST_LOG` unconditionally, so the environment variable has no
   effect until that is changed.
+- Ctrl-C stops the crawl gracefully (in-flight pages finish, summary prints,
+  exit 130); a second Ctrl-C aborts.
 - The `quotes` spider needs a WebDriver on `localhost:4444`
   (`chromedriver --port=4444`; see `web_crawler_blackhat/docs/README.md`).
 - The `cvedetails` site no longer serves the table markup the spider parses, so
@@ -100,9 +103,11 @@ bounded mpsc channels:
   `visited_urls` set, a `VecDeque` frontier, and an `outstanding` count of
   URLs handed over but not yet reported. Each turn is a `tokio::select!`
   between a report arriving and `urls_to_visit_tx.reserve()` finding room
-  (that branch only enabled while the frontier is non-empty). It exits when
-  the frontier is empty and nothing is outstanding, or when `new_urls`
-  closes, which can only mean the scraper task died. It then drops
+  (that branch only enabled while the frontier is non-empty and the crawl
+  is not stopping), plus a `CancellationToken` branch. A page limit or a
+  cancellation sets `stop_reason`, which stops dispatching; the loop then
+  exits when nothing is outstanding, or at once when `new_urls` closes,
+  which can only mean the scraper task died. It then drops
   `urls_to_visit_tx`, which ends the scraper stream, which drops `items_tx`,
   which ends the processor stream. `run` awaits both join handles, always
   both, turns a `JoinError` into `Error::Internal`, and otherwise returns

@@ -55,11 +55,16 @@ and the fix. Status: **done**, **in progress**, or **open**.
    nothing. Fixed with item 5: the loop now sleeps inside `select!` until a
    report arrives or channel capacity frees up.
 
-7. **No way to stop a crawl.** `open`
-   There is no cancellation token, no page limit, and no Ctrl-C handling. A
-   crawl runs until the frontier is empty. Fix: a `CancellationToken` (or a
-   `watch` channel) checked by the control loop, plus an optional
-   `max_pages`.
+7. **No way to stop a crawl.** `done`
+   There was no cancellation, no page limit, and Ctrl-C killed the process
+   mid-write with no summary. Stopping is now "behave as if the frontier were
+   empty": a `CancellationToken` branch and a `max_pages` check in the
+   control loop set a `stop_reason`, dispatching stops, in-flight pages
+   finish, items are processed, and `run` returns stats carrying the reason
+   and the frontier size. `main` wires Ctrl-C to the token (a second press
+   aborts), adds `--max-pages`, and exits 130 on cancellation. Covered by the
+   endless-spider tests. Interrupting an in-flight request itself is still
+   open; stop latency is bounded by concurrency × (HTTP timeout + delay).
 
 8. **Processing errors are swallowed.** `done`
    `let _ = spider.process(item).await;` discarded the error without even a

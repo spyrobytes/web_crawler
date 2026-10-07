@@ -57,6 +57,7 @@ Run it:
 ```bash
 cargo run --package web_crawler_blackhat -- spiders
 cargo run --package web_crawler_blackhat -- run --spider github
+cargo run --package web_crawler_blackhat -- run --spider github --max-pages 2
 ```
 
 Test and lint it:
@@ -72,6 +73,9 @@ Two things to know before running it:
 - The spiders return errors instead of panicking on unexpected markup. The
   crawler logs and counts those, prints a summary at the end, and exits
   non-zero if any page or item was lost.
+- Ctrl-C stops the crawl gracefully: nothing new is fetched, in-flight pages
+  finish, the summary prints, and the exit code is 130. A second Ctrl-C
+  aborts. `--max-pages N` bounds a run the same graceful way.
 
 ### Where it is heading
 
