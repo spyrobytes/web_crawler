@@ -47,22 +47,29 @@ async fn main() -> Result<(), anyhow::Error> {
             .as_str();
         let crawler = Crawler::new(Duration::from_millis(200), 2, 500);
 
-        match spider_name {
+        let stats = match spider_name {
             "cvedetails" => {
                 let spider = Arc::new(spiders::cvedetails::CveDetailsSpider::new());
-                crawler.run(spider).await?;
+                crawler.run(spider).await?
             }
             "github" => {
                 let spider = Arc::new(spiders::github::GitHubSpider::new());
-                crawler.run(spider).await?;
+                crawler.run(spider).await?
             }
             "quotes" => {
                 let spider = spiders::quotes::QuotesSpider::new().await?;
                 let spider = Arc::new(spider);
-                crawler.run(spider).await?;
+                crawler.run(spider).await?
             }
             _ => return Err(Error::InvalidSpider(spider_name.to_string()).into()),
         };
+
+        // The crawl itself ran to completion; whether it counts as a success
+        // is the caller's call. For an unattended run, anything lost along
+        // the way should show up in the exit code, not just in the log.
+        if stats.has_failures() {
+            return Err(Error::Internal(format!("crawl finished with failures ({stats})")).into());
+        }
     }
 
     Ok(())

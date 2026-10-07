@@ -3,7 +3,11 @@ use crate::spiders::Spider;
 use futures::stream::StreamExt;
 use std::{
     collections::{HashSet, VecDeque},
-    sync::Arc,
+    fmt,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tokio::{
@@ -11,6 +15,56 @@ use tokio::{
     task::{JoinError, JoinHandle},
     time::sleep,
 };
+
+/// What a finished crawl did, and what went wrong along the way.
+///
+/// `run` returns this on success. An `Err` from `run` is reserved for the
+/// crawler's own machinery failing (a task died); a page that could not be
+/// scraped or an item that could not be processed is counted here instead,
+/// so that nothing fails silently and the caller decides how strict to be.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CrawlStats {
+    /// Pages whose `scrape` returned `Ok`.
+    pub pages_scraped: usize,
+    /// Pages whose `scrape` returned `Err` (logged at the time).
+    pub scrape_errors: usize,
+    /// Items whose `process` returned `Ok`.
+    pub items_processed: usize,
+    /// Items whose `process` returned `Err` (logged at the time).
+    pub process_errors: usize,
+}
+
+impl CrawlStats {
+    pub fn has_failures(&self) -> bool {
+        self.scrape_errors > 0 || self.process_errors > 0
+    }
+}
+
+impl fmt::Display for CrawlStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "pages scraped: {}, scrape errors: {}, items processed: {}, processing errors: {}",
+            self.pages_scraped, self.scrape_errors, self.items_processed, self.process_errors
+        )
+    }
+}
+
+// Tallies kept inside each task and handed back through its `JoinHandle`.
+// They are atomics only because `for_each_concurrent` runs several futures
+// against the same counters; nothing outside the task reads them until the
+// task has finished.
+#[derive(Default)]
+struct ScraperTally {
+    pages_scraped: AtomicUsize,
+    scrape_errors: AtomicUsize,
+}
+
+#[derive(Default)]
+struct ProcessorTally {
+    items_processed: AtomicUsize,
+    process_errors: AtomicUsize,
+}
 
 pub struct Crawler {
     delay: Duration,
@@ -34,7 +88,7 @@ impl Crawler {
     pub async fn run<T: Send + 'static>(
         &self,
         spider: Arc<dyn Spider<Item = T>>,
-    ) -> Result<(), Error> {
+    ) -> Result<CrawlStats, Error> {
         let crawling_concurrency = self.crawling_concurrency;
         let crawling_queue_capacity = crawling_concurrency * 400;
         let processing_concurrency = self.processing_concurrency;
@@ -154,25 +208,53 @@ impl Crawler {
         let processors = processors
             .await
             .map_err(|err| task_failure("processor", err));
+        let (scraper_tally, processor_tally) = (scrapers?, processors?);
 
-        scrapers.and(processors)
+        let stats = CrawlStats {
+            pages_scraped: scraper_tally.pages_scraped.into_inner(),
+            scrape_errors: scraper_tally.scrape_errors.into_inner(),
+            items_processed: processor_tally.items_processed.into_inner(),
+            process_errors: processor_tally.process_errors.into_inner(),
+        };
+        log::info!("crawler: {stats}");
+
+        Ok(stats)
     }
 
     // Launching the processors is a matter of spawning a new task with a
     // stream and for_each_concurrent. The task ends when the stream ends, and
-    // the caller learns about it through the returned join handle.
+    // the caller gets its tally through the returned join handle.
     fn launch_processors<T: Send + 'static>(
         &self,
         concurrency: usize,
         spider: Arc<dyn Spider<Item = T>>,
         items: mpsc::Receiver<T>,
-    ) -> JoinHandle<()> {
+    ) -> JoinHandle<ProcessorTally> {
         tokio::spawn(async move {
+            let tally = ProcessorTally::default();
+            let spider_name = spider.name();
+
             tokio_stream::wrappers::ReceiverStream::new(items)
                 .for_each_concurrent(concurrency, |item| async {
-                    let _ = spider.process(item).await;
+                    // `process` is where the real work happens (today a
+                    // print, soon a database write), so a failure here is a
+                    // scraped item lost. It must be logged and counted, not
+                    // discarded with `let _ =`. The crawler cannot show the
+                    // item itself (it knows nothing about `T`), so the
+                    // spider's error has to carry whatever identifies it.
+                    match spider.process(item).await {
+                        Ok(()) => {
+                            tally.items_processed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(err) => {
+                            log::error!("{spider_name}: processing an item failed: {err}");
+                            tally.process_errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 })
                 .await;
+
+            tally
         })
     }
 
@@ -190,33 +272,41 @@ impl Crawler {
         new_urls_tx: mpsc::Sender<(String, Vec<String>)>,
         items_tx: mpsc::Sender<T>,
         delay: Duration,
-    ) -> JoinHandle<()> {
+    ) -> JoinHandle<ScraperTally> {
         tokio::spawn(async move {
+            let tally = ScraperTally::default();
+            let spider_name = spider.name();
+
             tokio_stream::wrappers::ReceiverStream::new(urls_to_visit)
                 .for_each_concurrent(concurrency, |queued_url| async {
                     let mut urls = Vec::new();
-                    let res = spider
-                        .scrape(queued_url.clone())
-                        .await
-                        .map_err(|err| {
-                            log::error!("{}", err);
-                            err
-                        })
-                        .ok();
 
-                    if let Some((items, new_urls)) = res {
-                        for item in items {
-                            let _ = items_tx.send(item).await;
+                    match spider.scrape(queued_url.clone()).await {
+                        Ok((items, new_urls)) => {
+                            tally.pages_scraped.fetch_add(1, Ordering::Relaxed);
+                            for item in items {
+                                // A failed send means the processor task is
+                                // gone, which the join handle reports; there
+                                // is nothing useful to do with the item here.
+                                let _ = items_tx.send(item).await;
+                            }
+                            urls = new_urls;
                         }
-                        urls = new_urls;
+                        Err(err) => {
+                            log::error!("{spider_name}: scraping {queued_url} failed: {err}");
+                            tally.scrape_errors.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
 
+                    // Same reasoning: the only way this fails is if the
+                    // control loop has already stopped listening.
                     let _ = new_urls_tx.send((queued_url, urls)).await;
                     sleep(delay).await;
                 })
                 .await;
 
             drop(items_tx);
+            tally
         })
     }
 }
@@ -323,13 +413,88 @@ mod tests {
         let dyn_spider: Arc<dyn Spider<Item = u32>> = spider.clone();
         let crawler = Crawler::new(Duration::from_millis(0), 2, 2);
 
-        tokio::time::timeout(Duration::from_secs(2), crawler.run(dyn_spider))
+        let stats = tokio::time::timeout(Duration::from_secs(2), crawler.run(dyn_spider))
             .await
             .expect("crawler should finish")
             .expect("a well-behaved spider should not produce an error");
 
         assert_eq!(spider.scraped.load(Ordering::SeqCst), 2);
         assert_eq!(spider.processed.load(Ordering::SeqCst), 5);
+        assert_eq!(
+            stats,
+            CrawlStats {
+                pages_scraped: 2,
+                scrape_errors: 0,
+                items_processed: 5,
+                process_errors: 0,
+            }
+        );
+        assert!(!stats.has_failures());
+    }
+
+    // Two pages; the second cannot be scraped and the even items cannot be
+    // processed. None of that is the crawler's fault, so `run` succeeds and
+    // the stats say what was lost.
+    struct FlakySpider {
+        attempted: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Spider for FlakySpider {
+        type Item = u32;
+
+        fn name(&self) -> String {
+            String::from("flaky")
+        }
+
+        fn start_urls(&self) -> Vec<String> {
+            vec![String::from("good"), String::from("bad")]
+        }
+
+        async fn scrape(&self, url: String) -> Result<(Vec<u32>, Vec<String>), Error> {
+            match url.as_str() {
+                "good" => Ok((vec![1, 2, 3, 4, 5], Vec::new())),
+                other => Err(Error::Internal(format!("{other}: simulated 503"))),
+            }
+        }
+
+        async fn process(&self, item: u32) -> Result<(), Error> {
+            self.attempted.fetch_add(1, Ordering::SeqCst);
+            if item.is_multiple_of(2) {
+                Err(Error::Internal(format!(
+                    "item {item}: simulated write failure"
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_counts_scrape_and_process_failures_instead_of_hiding_them() {
+        let spider = Arc::new(FlakySpider {
+            attempted: AtomicUsize::new(0),
+        });
+        let dyn_spider: Arc<dyn Spider<Item = u32>> = spider.clone();
+        let crawler = Crawler::new(Duration::from_millis(0), 2, 2);
+
+        let stats = tokio::time::timeout(Duration::from_secs(2), crawler.run(dyn_spider))
+            .await
+            .expect("crawler should finish")
+            .expect("spider failures are not crawler failures");
+
+        // every item still reached `process` before `run` returned
+        assert_eq!(spider.attempted.load(Ordering::SeqCst), 5);
+        assert_eq!(
+            stats,
+            CrawlStats {
+                pages_scraped: 1,
+                scrape_errors: 1,
+                items_processed: 3,
+                process_errors: 2,
+            }
+        );
+        assert!(stats.has_failures());
     }
 
     #[tokio::test]
