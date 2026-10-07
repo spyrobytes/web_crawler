@@ -1,13 +1,15 @@
 # Rust Web Crawler Learning Workspace
 
 This repository is a Rust learning journal built around one practical project:
-building a web crawler from first principles.
+building a web crawler from first principles, and then growing it into a tool
+that solves a real-world problem.
 
-The main focus is the `web_crawler` crate. The rest of the workspace contains
-small experiments, references, and concept drills for ideas that surfaced while
-working on the crawler: async tasks, URL queues, ownership, trait objects,
-associated types, HTML parsing, blocking vs non-blocking HTTP, Rayon, Tokio, and
-basic crawler architecture.
+The main line is the `web_crawler_blackhat` crate. It started as the chapter 5
+crawler from *Black Hat Rust* by Sylvain Kerkour and is the scaffold everything
+else now feeds into. The rest of the workspace holds the experiments, concept
+drills, and earlier attempts that surfaced along the way: async tasks, URL
+queues, ownership, trait objects, associated types, HTML parsing, blocking vs
+non-blocking HTTP, Rayon, Tokio, and basic crawler architecture.
 
 The goal is not only to produce a crawler, but to document the nitty-gritty of
 learning Rust through a real problem.
@@ -16,61 +18,94 @@ learning Rust through a real problem.
 
 ```text
 .
-├── web_crawler/             # Main project: crawler structure and iterations
+├── web_crawler_blackhat/    # Main line: generic crawler + site-specific spiders
+├── web_crawler/             # Earlier hand-rolled design (UrlManager, Scraper, Processor)
 ├── crawler_playground/      # Scraping experiments and small crawler prototypes
 ├── concurrency_pattern/     # Rust concept drills: traits, bounds, progress UI
 ├── wiki_crawler/            # Parallel Wikipedia example using Rayon
-├── web_crawler_blackhat/    # More complete reference-style crawler
 ├── docs/                    # Notes, architecture sketches, and learning logs
-├── data/                    # Small local files for examples
-└── static/                  # Generated crawler output, when examples write pages
+├── data/                    # Small local files read by the drills
+└── static/                  # Generated output from the playground (gitignored)
 ```
 
-## Main Thread: `web_crawler`
+`CLAUDE.md` records the end goal, the ordered objectives, and the architecture
+in more depth. `AGENTS.md` holds the workspace conventions.
 
-`web_crawler` is where the crawler design is being worked out.
+## Main Thread: `web_crawler_blackhat`
 
-It currently explores:
+A generic `Crawler` drives any type that implements the `Spider` trait. A spider
+owns its own HTTP or WebDriver client and provides two async methods: `scrape`
+turns a URL into structured items plus new URLs, and `process` consumes one
+item. The crawler owns the URL queue, the visited set, the concurrency limits,
+and shutdown.
 
-- URL ownership and queue management with `UrlManager`
-- A crawler shape built from `Spider`, `Scraper`, and `Processor`
-- Sharing state with `Arc` and `Mutex`
-- Running crawl work with Tokio tasks
-- Sending completion signals with channels
-- Iterating on bugs, such as a URL loop that never terminated
+Inside `Crawler::run` three parties cooperate over bounded channels: a scraper
+task, a processor task, and a control loop that dedupes URLs and decides when
+the crawl is finished. The design is described in
+`web_crawler_blackhat/docs/NOTES.md` and in `CLAUDE.md`.
 
-Run the main versions:
+Three demo spiders ship with it:
+
+| Spider | Source | Notes |
+|---|---|---|
+| `github` | GitHub REST API, JSON | Works live; paginates until a short page |
+| `cvedetails` | HTML table | The site has changed its markup since the book; a live run now returns zero items. The parsing path is covered by unit tests |
+| `quotes` | JS-rendered page via WebDriver | Needs a driver on `localhost:4444` |
+
+Run it:
+
+```bash
+cargo run --package web_crawler_blackhat -- spiders
+cargo run --package web_crawler_blackhat -- run --spider github
+```
+
+Test and lint it:
+
+```bash
+cargo test --package web_crawler_blackhat
+cargo clippy --package web_crawler_blackhat --all-targets
+```
+
+Two things to know before running it:
+
+- `main.rs` sets `RUST_LOG` itself, so the environment variable is ignored.
+- The spiders return errors instead of panicking on unexpected markup. That
+  matters because a panic inside a spider does not crash the process; it kills
+  the scraper task and leaves the control loop waiting forever.
+
+### Where it is heading
+
+The book's crawler is a readable chapter, not a tool you can leave running. The
+next steps, in order, are: making shutdown robust against panics, structured
+errors, persistence instead of `println!`, politeness (rate limits, robots.txt,
+backoff), network-free tests against a local server, and folding the useful
+parts of `web_crawler/` into this crate. The concrete real-world target is still
+to be chosen; the demo spiders are placeholders for it.
+
+## Supporting Crates
+
+### `web_crawler`
+
+The first design, built before adopting the book's structure. It explores URL
+ownership with a `UrlManager`, a crawler shape made of `Spider`, `Scraper`, and
+`Processor`, shared state with `Arc` and `Mutex`, and Tokio tasks with channels.
+
+Two caveats worth knowing: the two binaries contain the same logic despite the
+changelog in `web_crawler_v2.rs`, and the main loop awaits each spawned task
+immediately, so the crawl is sequential. Its URL normalisation and its
+deterministic tests are the parts that will move into the main line.
 
 ```bash
 cargo run --package web_crawler --bin web_crawler_main
-cargo run --package web_crawler --bin web_crawler_v2
+cargo test --package web_crawler
 ```
-
-Check or lint:
-
-```bash
-cargo check --package web_crawler --bin web_crawler_v2
-cargo clippy --package web_crawler --bin web_crawler_v2
-```
-
-## Supporting Crates
 
 ### `crawler_playground`
 
 Small scraping programs used to understand the mechanics before folding ideas
-back into the main crawler.
-
-Topics covered:
-
-- Fetching pages with `reqwest`
-- Extracting links with `select`
-- Using CSS selectors with `scraper`
-- Sequential crawling
-- Parallel crawling with Rayon
-- Writing fetched pages to local files
-- Scraping examples such as IMDb and Hacker News
-
-Examples:
+back into the crawler: fetching with `reqwest`, extracting links with `select`,
+CSS selectors with `scraper`, sequential and Rayon-parallel crawling, writing
+fetched pages to `static/`, and IMDb and Hacker News one-offs.
 
 ```bash
 cargo run --package crawler_playground --bin crawler_playground
@@ -80,55 +115,14 @@ cargo run --package crawler_playground --bin imdb_web_scraper
 
 ### `concurrency_pattern`
 
-Focused examples for Rust concepts that support the crawler work.
-
-Topics include:
-
-- Associated types
-- Static trait bounds
-- File IO
-- Terminal spinners and progress indicators
-
-Examples:
-
-```bash
-cargo run --package concurrency_pattern --bin associated_types_1
-cargo run --package concurrency_pattern --bin static_trait_bound_1
-cargo run --package concurrency_pattern --bin animate_with_indicatif
-```
+Focused examples for Rust concepts that support the crawler work: associated
+types, `'static` trait bounds, and terminal progress indicators. The drills read
+sample files from `data/`, so run them from the workspace root.
 
 ### `wiki_crawler`
 
-A compact parallel-processing example using the `wikipedia` crate and Rayon.
-It fetches several pages, processes their content, and prints timing metrics.
-
-```bash
-cargo run --package webcrawl-wikipedia-rayon
-```
-
-### `web_crawler_blackhat`
-
-A more complete crawler reference inspired by Black Hat Rust style architecture.
-It has a generic crawler engine and pluggable spiders.
-
-This crate is useful for comparison with the simpler `web_crawler` crate because
-it separates:
-
-- The crawler control loop
-- The spider trait
-- URL scheduling
-- Scraping
-- Item processing
-
-Examples:
-
-```bash
-cargo run --package web_crawler_blackhat -- spiders
-cargo run --package web_crawler_blackhat -- run --spider github
-```
-
-The `quotes` spider uses WebDriver and expects a compatible driver at
-`http://localhost:4444`.
+A parallel Wikipedia fetch with Rayon and the `wikipedia` crate, timing the work
+per page.
 
 ## Documentation
 
@@ -148,44 +142,30 @@ path, not just the final implementation.
 Start here:
 
 1. Read `docs/design-notes.md` for the architecture direction.
-2. Read `web_crawler/src/main.rs` to see the first crawler attempt.
-3. Read `web_crawler/src/web_crawler_v2.rs` to see the first important fix.
-4. Explore `crawler_playground` for scraping mechanics.
-5. Use `concurrency_pattern` when a Rust concept needs to be isolated.
-6. Compare against `web_crawler_blackhat` for a more developed crawler pattern.
+2. Read `web_crawler_blackhat/docs/NOTES.md` for the spider and control-loop
+   design, then `web_crawler_blackhat/src/crawler.rs` to see it in code.
+3. Read `web_crawler_blackhat/src/spiders/cvedetails.rs` for a spider that
+   parses HTML defensively, with its tests.
+4. Read `web_crawler/src/main.rs` to see the earlier attempt and compare the
+   two designs.
+5. Explore `crawler_playground` for scraping mechanics.
+6. Use `concurrency_pattern` when a Rust concept needs to be isolated.
 
 ## Requirements
 
-- Rust stable toolchain
-- Cargo
+- Rust stable toolchain and Cargo
 - Network access for examples that fetch live websites
 - Optional: WebDriver running on `localhost:4444` for the JS-rendered quotes
-  spider in `web_crawler_blackhat`
+  spider (see `web_crawler_blackhat/docs/README.md`)
 
 ## Common Commands
 
-Build the workspace:
-
 ```bash
-cargo build
-```
-
-Check the workspace:
-
-```bash
-cargo check
-```
-
-Run Clippy:
-
-```bash
-cargo clippy --workspace --all-targets
-```
-
-Format:
-
-```bash
-cargo fmt
+cargo check --workspace --all-targets   # type-check everything
+cargo build                             # build the workspace
+cargo test --workspace                  # all unit tests, no network needed
+cargo clippy --workspace --all-targets  # lint
+cargo fmt                               # format
 ```
 
 ## Project Philosophy

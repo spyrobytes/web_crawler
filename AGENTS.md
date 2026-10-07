@@ -2,15 +2,16 @@
 
 ## Project Structure & Module Organization
 
-This is a Cargo workspace centered on `web_crawler/`. The main crawler binaries live in `web_crawler/src/main.rs` and `web_crawler/src/web_crawler_v2.rs`. Supporting learning crates are organized by topic: `crawler_playground/` for scraping experiments, `concurrency_pattern/` for Rust concept drills, `wiki_crawler/` for Rayon-based page processing, and `web_crawler_blackhat/` for a fuller reference crawler. Notes and diagrams live in `docs/`; small sample files live in `data/`.
+This is a Cargo workspace centered on `web_crawler_blackhat/`, the crawler scaffolded on *Black Hat Rust* chapter 5 that is being grown into a real-world tool; its control loop lives in `web_crawler_blackhat/src/crawler.rs` and site-specific spiders under `web_crawler_blackhat/src/spiders/`. Supporting learning crates are organized by topic: `web_crawler/` for the earlier hand-rolled design, `crawler_playground/` for scraping experiments, `concurrency_pattern/` for Rust concept drills, and `wiki_crawler/` for Rayon-based page processing. Notes and diagrams live in `docs/`; small sample files live in `data/`.
 
 ## Build, Test, and Development Commands
 
 - `cargo build`: build the full workspace.
 - `cargo check`: type-check the workspace quickly.
-- `cargo run --package web_crawler --bin web_crawler_main`: run the main crawler test drive.
-- `cargo run --package web_crawler --bin web_crawler_v2`: run the v2 crawler binary.
-- `cargo test --package web_crawler --bin web_crawler_main`: run focused tests for the main crawler.
+- `cargo run --package web_crawler_blackhat -- spiders`: list the available spiders.
+- `cargo run --package web_crawler_blackhat -- run --spider github`: run the main crawler with one spider.
+- `cargo test --package web_crawler_blackhat`: run the main crawler's unit tests (no network needed).
+- `cargo run --package web_crawler --bin web_crawler_main`: run the earlier crawler design.
 - `cargo clippy --workspace --all-targets`: lint all workspace targets.
 - `cargo fmt`: format Rust sources with rustfmt.
 
