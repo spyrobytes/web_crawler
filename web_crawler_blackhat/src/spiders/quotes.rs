@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use fantoccini::{Client, ClientBuilder};
 use select::{
     document::Document,
+    node::Node,
     predicate::{Class, Name, Predicate},
 };
 use tokio::sync::Mutex;
@@ -18,7 +19,8 @@ impl QuotesSpider {
         caps.insert("goog:chromeOptions".to_string(), chrome_opts);
         // fantoccini 0.20+ returns a Result here because building the
         // rustls connector can fail.
-        let mut builder = ClientBuilder::rustls().map_err(|err| Error::WebDriver(err.to_string()))?;
+        let mut builder =
+            ClientBuilder::rustls().map_err(|err| Error::WebDriver(err.to_string()))?;
         let webdriver_client = builder
             .capabilities(caps)
             .connect("http://localhost:4444")
@@ -58,26 +60,13 @@ impl super::Spider for QuotesSpider {
 
         let document = Document::from(html.as_str());
 
-        let quotes = document.find(Class("quote"));
-        for quote in quotes {
-            let mut spans = quote.find(Name("span"));
-            let quote_span = spans.next().unwrap();
-            let quote_str = quote_span.text().trim().to_string();
-
-            let author = spans
-                .next()
-                .unwrap()
-                .find(Class("author"))
-                .next()
-                .unwrap()
-                .text()
-                .trim()
-                .to_string();
-
-            items.push(QuotesItem {
-                quote: quote_str,
-                author,
-            });
+        for quote in document.find(Class("quote")) {
+            // A single odd block should not cost us the rest of the page, so
+            // we log it and keep going.
+            match parse_quote(&url, quote) {
+                Ok(item) => items.push(item),
+                Err(err) => log::warn!("{}", err),
+            }
         }
 
         let next_pages_link = document
@@ -100,6 +89,31 @@ impl super::Spider for QuotesSpider {
     }
 }
 
+// Parse one `.quote` block.
+//
+// These used to be `unwrap()`s. A panic inside a spider does not crash the
+// program: tokio catches it at the task boundary, which kills the scraper
+// task and leaves the crawler's control loop waiting forever.
+fn parse_quote(url: &str, quote: Node<'_>) -> Result<QuotesItem, Error> {
+    let mut spans = quote.find(Name("span"));
+
+    let quote_str = spans
+        .next()
+        .map(|span| span.text().trim().to_string())
+        .ok_or_else(|| Error::Internal(format!("{url}: quote block has no text span")))?;
+
+    let author = spans
+        .next()
+        .and_then(|span| span.find(Class("author")).next())
+        .map(|node| node.text().trim().to_string())
+        .ok_or_else(|| Error::Internal(format!("{url}: quote block has no author")))?;
+
+    Ok(QuotesItem {
+        quote: quote_str,
+        author,
+    })
+}
+
 impl QuotesSpider {
     fn normalize_url(&self, url: &str) -> String {
         let url = url.trim();
@@ -109,5 +123,50 @@ impl QuotesSpider {
         }
 
         url.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const URL: &str = "https://quotes.toscrape.com/js";
+
+    fn parse(block: &str) -> Result<QuotesItem, Error> {
+        let document = Document::from(block);
+        let quote = document
+            .find(Class("quote"))
+            .next()
+            .expect("test html has one quote block");
+        parse_quote(URL, quote)
+    }
+
+    #[test]
+    fn parses_a_well_formed_quote() {
+        let item = parse(
+            r#"<div class="quote">
+                 <span class="text">“Be yourself.”</span>
+                 <span>by <small class="author">Oscar Wilde</small></span>
+               </div>"#,
+        )
+        .expect("quote parses");
+
+        assert_eq!(item.quote, "“Be yourself.”");
+        assert_eq!(item.author, "Oscar Wilde");
+    }
+
+    #[test]
+    fn quote_without_author_is_an_error() {
+        let err = parse(r#"<div class="quote"><span class="text">“Be yourself.”</span></div>"#)
+            .expect_err("missing author is rejected");
+
+        assert!(err.to_string().contains("no author"), "{err}");
+    }
+
+    #[test]
+    fn empty_quote_block_is_an_error() {
+        let err = parse(r#"<div class="quote"></div>"#).expect_err("empty block is rejected");
+
+        assert!(err.to_string().contains("no text span"), "{err}");
     }
 }

@@ -65,8 +65,17 @@ impl super::Spider for GitHubSpider {
         let items: Vec<GitHubItem> = self.http_client.get(&url).send().await?.json().await?;
 
         let next_pages_links = if items.len() == self.expected_number_of_results {
-            let captures = self.page_regex.captures(&url).unwrap();
-            let old_page_number = captures.get(1).unwrap().as_str().to_string();
+            // We built this URL ourselves, so a missing page parameter is a
+            // bug. Surface it as an error rather than a panic: a panic would
+            // kill the scraper task and hang the crawler.
+            let missing_page =
+                || Error::Internal(format!("spider/github: no page parameter in {url}"));
+            let captures = self.page_regex.captures(&url).ok_or_else(missing_page)?;
+            let old_page_number = captures
+                .get(1)
+                .ok_or_else(missing_page)?
+                .as_str()
+                .to_string();
             let mut new_page_number = old_page_number
                 .parse::<usize>()
                 .map_err(|_| Error::Internal("spider/github: parsing page number".to_string()))?;
