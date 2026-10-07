@@ -43,9 +43,9 @@ Each item is both a robustness gap left by the book and a Rust lesson.
    `web_crawler_v2.rs`, and update `AGENTS.md`/`README.md`, which still call
    `web_crawler/` the centre of the workspace.
 
-Done so far: dependency upgrade to clap 4 / reqwest 0.13 / fantoccini 0.22
-(commit `e953c2c`), and spider parsing that returns errors instead of
-unwrapping, with inline-HTML unit tests.
+The itemised issue list behind these objectives, with status per item, is
+`web_crawler_blackhat/docs/HARDENING.md`. Update it when an item is fixed or
+a new one is found.
 
 ## Commands
 
