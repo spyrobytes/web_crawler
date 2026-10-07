@@ -80,15 +80,14 @@ and the fix. Status: **done**, **in progress**, or **open**.
 
 ## CLI (`main.rs`)
 
-10. **`RUST_LOG` is overwritten.** `open`
-    `env::set_var("RUST_LOG", ..)` runs before `env_logger::init()`, so the
-    user's setting is ignored. Fix: `Env::default().default_filter_or(..)`.
+10. **`RUST_LOG` is overwritten.** `done`
+    `env::set_var("RUST_LOG", ..)` ran before `env_logger::init()`, so the
+    user's setting was ignored. Now `Env::default().default_filter_or("info")`:
+    `info` unless the environment says otherwise.
 
-11. **Spider names are listed twice.** `open`
-    The `spiders` subcommand prints a hard-coded list; each spider also has a
-    `name()` that until recently nothing called (it now prefixes the
-    scrape and process error logs). Fix: one
-    registry of constructors keyed by `name()`, used by both subcommands.
+11. **Spider names are listed twice.** `done`
+    Each spider now has a `pub const NAME`; `name()` returns it, and `main`
+    builds the `spiders` listing and the `run` match from the same constants.
 
 ## Errors (`error.rs`)
 
@@ -96,10 +95,12 @@ and the fix. Status: **done**, **in progress**, or **open**.
     The display string was `"Internal"`, so every message built by a spider
     logged as the bare word.
 
-13. **Errors are stringly and carry no retry information.** `open`
-    (roadmap: structured errors) Callers cannot tell a 429 from a parse error.
-    Fix: variants per failure kind, with the source error attached where the
-    `From` impls currently flatten it to a `String`.
+13. **Errors are stringly and carry no retry information.** `done`
+    `Error` now has `Fetch` (with the `reqwest` source attached), `HttpStatus`,
+    `RateLimited` (with `Retry-After` when given), `Parse`, `WebDriver`,
+    `Internal` and `InvalidSpider`, plus `is_retryable()`. Nothing retries yet
+    (that is item 9); the scrape-error log already says which failures would
+    have been worth it.
 
 ## Spiders (`spiders/`)
 
@@ -107,27 +108,29 @@ and the fix. Status: **done**, **in progress**, or **open**.
     Replaced with errors; bad rows are skipped with a warning so pagination
     survives. Covered by inline-HTML unit tests.
 
-15. **No HTTP status check.** `open`
-    `send().await?` does not fail on 4xx/5xx. A GitHub rate-limit response
-    (403/429) is fed to `.json()`, fails to parse, and is logged as a reqwest
-    error; pagination then stops silently. Fix: `error_for_status()` and a
-    distinct error variant for rate limiting.
+15. **No HTTP status check.** `done`
+    `send().await?` did not fail on 4xx/5xx, so a rate-limit page was fed to
+    the parser. `spiders::get_checked`/`get_text`/`get_json` now turn any
+    non-2xx into `HttpStatus` or `RateLimited` (429; GitHub's 403 with
+    `x-ratelimit-remaining: 0`; 503 with `Retry-After`) before the body is
+    looked at. Covered by mock-server tests in both HTTP spiders.
 
-16. **"Zero items" on a page that should have some is not detected.** `open`
-    cvedetails has changed its markup since the book; the spider now returns
-    zero rows and exits cleanly, which looks like success. Fix: a spider
-    should be able to say "this page should have had items", and the crawler
-    should report pages that produced nothing.
+16. **"Zero items" on a page that should have some is not detected.** `done`
+    cvedetails now returns `Parse` when a list page has no
+    `#vulnslisttable`, and quotes when a page has no `.quote` blocks, instead
+    of a successful crawl of nothing. (Live, cvedetails currently answers
+    HTTP 403; with item 15 that is reported as such rather than as an empty
+    page.) `CrawlStats` also reports `empty_pages`
+    (scraped fine, no items, no links) so an all-empty crawl stands out.
 
 17. **URL normalisation is hand-rolled per spider and the `url` crate is
-    unused.** `open` (roadmap: consolidation)
-    Each spider string-prefixes relative links. `web_crawler/` already has a
-    correct `Url::join`-based version with tests; move it here.
+    unused.** `done`
+    `links::resolve(page_url, href)` joins with `Url::join`, strips
+    fragments, and drops non-page links; both HTML spiders use it. Ported
+    from `web_crawler/` with its tests.
 
-18. **The quotes spider serialises on a mutex.** `open` (documentation only)
-    One WebDriver client behind `tokio::sync::Mutex` means crawling
-    concurrency is effectively one for that spider. Fine for now; say so in
-    the spider.
+18. **The quotes spider serialises on a mutex.** `done` (documented)
+    A comment on the field now says that scrapes are serialised and why.
 
 ## Tests
 
@@ -137,6 +140,8 @@ and the fix. Status: **done**, **in progress**, or **open**.
     panics (`run` returns an error instead of hanging) and a counting spider
     whose five items are all processed before `run` returns.
 
-20. **No network-free fetch tests.** `open` (roadmap)
-    Spider `scrape` paths that touch HTTP are untested. Fix: a local `axum` or
-    `wiremock` server in tests.
+20. **No network-free fetch tests.** `done`
+    Both HTTP spiders take `with_base_url(..)` and are tested against a
+    `wiremock` server (dev-dependency): happy path with pagination, 5xx, 429
+    with `Retry-After`, GitHub's 403 quota signal, and bodies that are not
+    the expected page.

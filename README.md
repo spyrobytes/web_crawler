@@ -49,7 +49,7 @@ Three demo spiders ship with it:
 | Spider | Source | Notes |
 |---|---|---|
 | `github` | GitHub REST API, JSON | Works live; paginates until a short page |
-| `cvedetails` | HTML table | The site has changed its markup since the book; a live run now returns zero items. The parsing path is covered by unit tests |
+| `cvedetails` | HTML table | The site now answers HTTP 403 to the crawler, so a live run fails on the first page and exits non-zero. Parsing and fetching are covered by tests |
 | `quotes` | JS-rendered page via WebDriver | Needs a driver on `localhost:4444` |
 
 Run it:
@@ -69,7 +69,7 @@ cargo clippy --package web_crawler_blackhat --all-targets
 
 Two things to know before running it:
 
-- `main.rs` sets `RUST_LOG` itself, so the environment variable is ignored.
+- Logging defaults to `info`; set `RUST_LOG` to change it.
 - The spiders return errors instead of panicking on unexpected markup. The
   crawler logs and counts those, prints a summary at the end, and exits
   non-zero if any page or item was lost.

@@ -66,27 +66,31 @@ cargo run -p web_crawler_blackhat -- run --spider github --max-pages 2
 
 Runtime notes:
 
-- `main.rs` sets `RUST_LOG` unconditionally, so the environment variable has no
-  effect until that is changed.
+- Logging defaults to `info`; `RUST_LOG` overrides it as usual.
 - Ctrl-C stops the crawl gracefully (in-flight pages finish, summary prints,
   exit 130); a second Ctrl-C aborts.
 - The `quotes` spider needs a WebDriver on `localhost:4444`
   (`chromedriver --port=4444`; see `web_crawler_blackhat/docs/README.md`).
-- The `cvedetails` site no longer serves the table markup the spider parses, so
-  a live run exits immediately with zero items. Use the unit tests to exercise
-  the parsing path.
-- Live runs need network access. Prefer deterministic tests with inline HTML,
-  as in `spiders/cvedetails.rs` and `spiders/quotes.rs`.
+- The `cvedetails` site now answers our requests with HTTP 403, so a live run
+  fails on the first page with that status (before the status check it looked
+  like a successful crawl of zero items). Use the tests to exercise that spider.
+- Live runs need network access. Prefer deterministic tests: inline HTML for
+  parsing, and a `wiremock` server for the fetch path (both HTTP spiders take
+  `with_base_url` for this).
 
 ## Architecture of the blackhat crawler
 
-The design only makes sense across four files: `spiders/mod.rs`, `crawler.rs`,
-`main.rs`, `error.rs`.
+The design only makes sense across five files: `spiders/mod.rs`, `crawler.rs`,
+`main.rs`, `error.rs`, `links.rs`.
 
 **The `Spider` trait** (`spiders/mod.rs`) is the extension point. A spider
 declares an associated `Item` type and two async methods: `scrape(url)` returns
 `(items, new_urls)`, and `process(item)` consumes one item. Spiders own their
-own HTTP or WebDriver client and their own URL normalisation. The crawler never
+own HTTP or WebDriver client, expose a `pub const NAME` that `main` uses for
+both subcommands, fetch through the checked helpers in `spiders/mod.rs`
+(`get_text`, `get_json`: any non-2xx becomes an error before parsing), and
+resolve links with `links::resolve(page_url, href)`. The HTTP spiders take
+`with_base_url` so tests can point them at a local server. The crawler never
 looks inside an item; it is generic over `T` and holds `Arc<dyn Spider<Item = T>>`.
 
 **`Crawler::run`** (`crawler.rs`) wires three parties together with three
@@ -134,13 +138,14 @@ Consequences worth knowing before touching it:
   scrape still reports its URL as visited with no children. Returning an error from `scrape` therefore skips that page
   and its pagination; the spiders instead skip individual bad rows inside
   `scrape` so pagination survives.
-- `main.rs` hard-codes the spider list for the `spiders` subcommand separately
-  from each spider's `name()`. Keep them in sync, or better, derive one from
-  the other.
 
-**Errors** (`error.rs`): a single `Error` enum with string payloads, plus
-`From` impls for reqwest and fantoccini errors. Display strings must include
-the payload (`"Internal: {0}"`), since `crawler.rs` logs errors by `Display`.
+**Errors** (`error.rs`): one `Error` enum grouped by what a caller could do
+about it: `Fetch` (transport, with the `reqwest` source), `HttpStatus`,
+`RateLimited` (with `Retry-After`), `Parse` (the page is not what the spider
+expects, including a missing table or non-JSON body), `WebDriver`, `Internal`
+(our own bug), `InvalidSpider`. `is_retryable()` is the hook for backoff;
+nothing retries yet. Display strings include their payload, since `crawler.rs`
+logs errors by `Display`.
 
 ## The other crates
 
