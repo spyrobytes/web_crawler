@@ -2,11 +2,8 @@ use crate::error::Error;
 use crate::spiders::Spider;
 use futures::stream::StreamExt;
 use std::{
-    collections::HashSet,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+    collections::{HashSet, VecDeque},
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
@@ -14,29 +11,6 @@ use tokio::{
     task::{JoinError, JoinHandle},
     time::sleep,
 };
-
-// Counts one in-flight scrape for as long as it is alive.
-//
-// The control loop treats `active_spiders == 0` as "no work is in a scraper's
-// hands". That is only true if every increment is matched by a decrement.
-// Two plain statements cannot promise that: a panic inside `scrape`, or the
-// future being dropped early, would skip the decrement and the control loop
-// would wait forever. Tying the decrement to `Drop` makes it run on every
-// exit path: normal completion, panic unwinding, and cancellation.
-struct ActiveSpiderGuard(Arc<AtomicUsize>);
-
-impl ActiveSpiderGuard {
-    fn new(counter: &Arc<AtomicUsize>) -> Self {
-        counter.fetch_add(1, Ordering::SeqCst);
-        Self(Arc::clone(counter))
-    }
-}
-
-impl Drop for ActiveSpiderGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
 
 pub struct Crawler {
     delay: Duration,
@@ -61,61 +35,105 @@ impl Crawler {
         &self,
         spider: Arc<dyn Spider<Item = T>>,
     ) -> Result<(), Error> {
-        let mut visited_urls = HashSet::<String>::new();
         let crawling_concurrency = self.crawling_concurrency;
         let crawling_queue_capacity = crawling_concurrency * 400;
         let processing_concurrency = self.processing_concurrency;
         let processing_queue_capacity = processing_concurrency * 10;
-        let active_spiders = Arc::new(AtomicUsize::new(0));
 
-        // We create the channels that will be used to communicate between the
-        // different tasks.
+        // Three bounded channels connect the tasks:
+        //   control loop --urls_to_visit--> scrapers --items--> processors
+        //   control loop <--new_urls------- scrapers
+        // The first and last form a cycle, which is why the control loop
+        // below must never block on a send (see the loop comment).
         let (urls_to_visit_tx, urls_to_visit_rx) = mpsc::channel(crawling_queue_capacity);
         let (items_tx, items_rx) = mpsc::channel(processing_queue_capacity);
         let (new_urls_tx, mut new_urls_rx) = mpsc::channel(crawling_queue_capacity);
 
+        // The control loop owns all crawl state: what has been seen, what is
+        // waiting to be fetched, and how many URLs are currently in the
+        // scrapers' hands. None of it is shared, so none of it needs a lock.
+        let mut visited_urls = HashSet::<String>::new();
+        let mut frontier = VecDeque::<String>::new();
+        let mut outstanding: usize = 0;
+
         for url in spider.start_urls() {
-            visited_urls.insert(url.clone());
-            let _ = urls_to_visit_tx.send(url).await;
+            if visited_urls.insert(url.clone()) {
+                frontier.push_back(url);
+            }
         }
 
         let processors = self.launch_processors(processing_concurrency, spider.clone(), items_rx);
 
+        // `new_urls_tx` is moved, not cloned: the scraper task must own the
+        // only sender, so that `new_urls_rx.recv()` returning `None` means
+        // "the scraper task is gone" and nothing else.
         let scrapers = self.launch_scrapers(
             crawling_concurrency,
             spider.clone(),
             urls_to_visit_rx,
-            new_urls_tx.clone(),
+            new_urls_tx,
             items_tx,
-            active_spiders.clone(),
             self.delay,
         );
 
         // The Control Loop
-        // we queue new urls that have not been visited yet and check if we need
-        // to stop the crawler
+        //
+        // Each turn waits for whichever happens first: a scraper reports back,
+        // or there is room to hand the scrapers another URL. Waiting for room
+        // with `reserve()` instead of calling `send().await` is the whole
+        // point. If the loop blocked on a send into a full `urls_to_visit`,
+        // it would stop draining `new_urls`; once that filled too, the
+        // scrapers would block on their reports and nothing would move. Two
+        // bounded channels in a cycle deadlock unless one side never blocks.
+        //
+        // `outstanding` counts URLs from the moment they are handed over until
+        // their report arrives, so "frontier empty and nothing outstanding"
+        // is exactly "no work anywhere", with no gap for a URL to hide in
+        // between leaving the channel and being picked up by a scraper.
         loop {
-            if let Ok((visited_url, new_urls)) = new_urls_rx.try_recv() {
-                visited_urls.insert(visited_url);
-
-                for url in new_urls {
-                    if !visited_urls.contains(&url) {
-                        visited_urls.insert(url.clone());
-                        log::debug!("queueing: {}", url);
-                        let _ = urls_to_visit_tx.send(url).await;
-                    }
-                }
-            }
-
-            if new_urls_tx.capacity() == crawling_queue_capacity // new_urls channel is empty
-            && urls_to_visit_tx.capacity() == crawling_queue_capacity // urls_to_visit channel is empty
-            && active_spiders.load(Ordering::SeqCst) == 0
-            {
-                // no more work, we leave
+            if frontier.is_empty() && outstanding == 0 {
                 break;
             }
 
-            sleep(Duration::from_millis(5)).await;
+            tokio::select! {
+                report = new_urls_rx.recv() => {
+                    let Some((visited_url, new_urls)) = report else {
+                        // The only sender lived in the scraper task, so this
+                        // means that task has ended early (it panicked). The
+                        // join handle below will say why.
+                        log::error!(
+                            "crawler: scrapers stopped with {outstanding} urls outstanding"
+                        );
+                        break;
+                    };
+
+                    outstanding -= 1;
+                    log::debug!("visited: {visited_url}");
+
+                    for url in new_urls {
+                        if visited_urls.insert(url.clone()) {
+                            log::debug!("queueing: {url}");
+                            frontier.push_back(url);
+                        }
+                    }
+                }
+
+                // Only ask for room when there is something to send, otherwise
+                // this branch would hold a permit for nothing.
+                permit = urls_to_visit_tx.reserve(), if !frontier.is_empty() => {
+                    let Ok(permit) = permit else {
+                        // The receiver is gone: same situation as above.
+                        log::error!(
+                            "crawler: scrapers stopped with {outstanding} urls outstanding"
+                        );
+                        break;
+                    };
+
+                    let url = frontier.pop_front().expect("branch is guarded by !is_empty");
+                    outstanding += 1;
+                    permit.send(url);
+                }
+            }
         }
 
         log::info!("crawler: control loop exited");
@@ -158,11 +176,12 @@ impl Crawler {
         })
     }
 
-    // Launch the scrappers, much the same way as launching the processors.
-    // Though the logic here is a bit more complex. We need to keep track of
-    // the number of active spiders, and we need to sleep between each request
-    // in order not to flood the server (to avoid being banned).
-    #[allow(clippy::too_many_arguments)]
+    // Launch the scrapers, much the same way as launching the processors.
+    // Every URL taken from the stream produces exactly one report on
+    // `new_urls_tx`, whether the scrape succeeded or not; the control loop
+    // relies on that to know when the URL is no longer in flight. The sleep
+    // between requests is there not to flood the server (to avoid being
+    // banned).
     fn launch_scrapers<T: Send + 'static>(
         &self,
         concurrency: usize,
@@ -170,40 +189,30 @@ impl Crawler {
         urls_to_visit: mpsc::Receiver<String>,
         new_urls_tx: mpsc::Sender<(String, Vec<String>)>,
         items_tx: mpsc::Sender<T>,
-        active_spiders: Arc<AtomicUsize>,
         delay: Duration,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             tokio_stream::wrappers::ReceiverStream::new(urls_to_visit)
-                .for_each_concurrent(concurrency, |queued_url| {
-                    let queued_url = queued_url.clone();
-                    async {
-                        // `_guard`, not `_`: a bare `let _ = ...` drops the
-                        // value on this same line, which would release the
-                        // count before the scrape even starts. The guard
-                        // lives until the end of this block, after the delay,
-                        // so the throttle still counts as "active".
-                        let _guard = ActiveSpiderGuard::new(&active_spiders);
-                        let mut urls = Vec::new();
-                        let res = spider
-                            .scrape(queued_url.clone())
-                            .await
-                            .map_err(|err| {
-                                log::error!("{}", err);
-                                err
-                            })
-                            .ok();
+                .for_each_concurrent(concurrency, |queued_url| async {
+                    let mut urls = Vec::new();
+                    let res = spider
+                        .scrape(queued_url.clone())
+                        .await
+                        .map_err(|err| {
+                            log::error!("{}", err);
+                            err
+                        })
+                        .ok();
 
-                        if let Some((items, new_urls)) = res {
-                            for item in items {
-                                let _ = items_tx.send(item).await;
-                            }
-                            urls = new_urls;
+                    if let Some((items, new_urls)) = res {
+                        for item in items {
+                            let _ = items_tx.send(item).await;
                         }
-
-                        let _ = new_urls_tx.send((queued_url, urls)).await;
-                        sleep(delay).await;
+                        urls = new_urls;
                     }
+
+                    let _ = new_urls_tx.send((queued_url, urls)).await;
+                    sleep(delay).await;
                 })
                 .await;
 
@@ -223,59 +232,7 @@ fn task_failure(task: &str, err: JoinError) -> Error {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-
-    #[test]
-    fn guard_counts_while_alive_and_releases_on_drop() {
-        let counter = Arc::new(AtomicUsize::new(0));
-
-        let first = ActiveSpiderGuard::new(&counter);
-        let second = ActiveSpiderGuard::new(&counter);
-        assert_eq!(counter.load(Ordering::SeqCst), 2);
-
-        drop(first);
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
-
-        drop(second);
-        assert_eq!(counter.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn guard_releases_when_the_holder_panics() {
-        let counter = Arc::new(AtomicUsize::new(0));
-
-        let result = std::panic::catch_unwind({
-            let counter = Arc::clone(&counter);
-            move || {
-                let _guard = ActiveSpiderGuard::new(&counter);
-                panic!("simulated unwrap on bad markup");
-            }
-        });
-
-        assert!(result.is_err(), "the closure should have panicked");
-        assert_eq!(counter.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn guard_releases_when_the_future_is_cancelled() {
-        let counter = Arc::new(AtomicUsize::new(0));
-
-        let task = tokio::spawn({
-            let counter = Arc::clone(&counter);
-            async move {
-                let _guard = ActiveSpiderGuard::new(&counter);
-                std::future::pending::<()>().await;
-            }
-        });
-
-        // Give the task a turn so the guard exists before we cancel it.
-        while counter.load(Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
-        }
-
-        task.abort();
-        let _ = task.await;
-        assert_eq!(counter.load(Ordering::SeqCst), 0);
-    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // A spider that behaves like one with an `unwrap()` on bad markup.
     struct PanickingSpider;
@@ -304,9 +261,10 @@ mod tests {
         }
     }
 
-    // The guard lets the control loop exit after the panic; awaiting the
-    // join handles (instead of a barrier the dead task never reaches) lets
-    // `run` return and report it.
+    // The scraper task owns the only `new_urls` sender, so its death closes
+    // the channel and the control loop exits; awaiting the join handle
+    // (instead of a barrier the dead task never reaches) lets `run` return
+    // and report it.
     #[tokio::test]
     async fn run_returns_an_error_after_a_spider_panics() {
         let crawler = Crawler::new(Duration::from_millis(0), 2, 1);
@@ -355,8 +313,7 @@ mod tests {
         }
     }
 
-    // The property the barrier existed to protect: every item is processed
-    // before `run` returns. It must still hold without the barrier.
+    // Every item is processed before `run` returns.
     #[tokio::test]
     async fn run_processes_every_item_before_returning() {
         let spider = Arc::new(CountingSpider {
@@ -373,5 +330,89 @@ mod tests {
 
         assert_eq!(spider.scraped.load(Ordering::SeqCst), 2);
         assert_eq!(spider.processed.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn run_with_no_start_urls_returns_immediately() {
+        struct EmptySpider;
+
+        #[async_trait]
+        impl Spider for EmptySpider {
+            type Item = ();
+            fn name(&self) -> String {
+                String::from("empty")
+            }
+            fn start_urls(&self) -> Vec<String> {
+                Vec::new()
+            }
+            async fn scrape(&self, _url: String) -> Result<(Vec<()>, Vec<String>), Error> {
+                unreachable!("nothing should be scraped")
+            }
+            async fn process(&self, _item: ()) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let crawler = Crawler::new(Duration::from_millis(0), 2, 1);
+        let spider: Arc<dyn Spider<Item = ()>> = Arc::new(EmptySpider);
+
+        tokio::time::timeout(Duration::from_secs(2), crawler.run(spider))
+            .await
+            .expect("crawler should finish")
+            .expect("nothing can fail here");
+    }
+
+    // One root page that links to more pages than both channels can hold.
+    struct LeafySpider {
+        leaves: usize,
+        scraped: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Spider for LeafySpider {
+        type Item = ();
+
+        fn name(&self) -> String {
+            String::from("leafy")
+        }
+
+        fn start_urls(&self) -> Vec<String> {
+            vec![String::from("root")]
+        }
+
+        async fn scrape(&self, url: String) -> Result<(Vec<()>, Vec<String>), Error> {
+            self.scraped.fetch_add(1, Ordering::SeqCst);
+            if url == "root" {
+                let leaves = (0..self.leaves).map(|i| format!("leaf-{i}")).collect();
+                Ok((Vec::new(), leaves))
+            } else {
+                Ok((Vec::new(), Vec::new()))
+            }
+        }
+
+        async fn process(&self, _item: ()) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    // With concurrency 2 both channels hold 800. The control loop used to
+    // block on `send` into a full `urls_to_visit` while never draining
+    // `new_urls`; once 800 reports piled up, the scrapers blocked too and
+    // nothing moved. One page with more than 1,600 unseen links was enough.
+    #[tokio::test]
+    async fn run_survives_a_page_with_more_links_than_the_channels_hold() {
+        let spider = Arc::new(LeafySpider {
+            leaves: 1_700,
+            scraped: AtomicUsize::new(0),
+        });
+        let dyn_spider: Arc<dyn Spider<Item = ()>> = spider.clone();
+        let crawler = Crawler::new(Duration::from_millis(0), 2, 1);
+
+        tokio::time::timeout(Duration::from_secs(5), crawler.run(dyn_spider))
+            .await
+            .expect("crawler should finish instead of deadlocking")
+            .expect("a well-behaved spider should not produce an error");
+
+        assert_eq!(spider.scraped.load(Ordering::SeqCst), 1_701);
     }
 }
