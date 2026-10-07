@@ -69,9 +69,9 @@ cargo clippy --package web_crawler_blackhat --all-targets
 Two things to know before running it:
 
 - `main.rs` sets `RUST_LOG` itself, so the environment variable is ignored.
-- The spiders return errors instead of panicking on unexpected markup. That
-  matters because a panic inside a spider does not crash the process; it kills
-  the scraper task and leaves the control loop waiting forever.
+- The spiders return errors instead of panicking on unexpected markup. The
+  crawler logs and counts those, prints a summary at the end, and exits
+  non-zero if any page or item was lost.
 
 ### Where it is heading
 

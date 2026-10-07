@@ -25,7 +25,10 @@ and the fix. Status: **done**, **in progress**, or **open**.
 
 3. **`run` cannot report failure.** `done`
    It returns `()`, so a crawl whose scraper task died still exits with status
-   zero. `run` now returns `Result<(), Error>` and `main` propagates it with `?`.
+   zero. `run` now returns `Result<CrawlStats, Error>`: `Err` for the crawler's
+   own machinery failing, `Ok(stats)` with counts of pages scraped, scrape
+   errors, items processed and processing errors otherwise. `main` logs the
+   summary and exits non-zero if anything was lost.
 
 4. **Termination check can fire while a URL is between the channel and its
    guard.** `done`
@@ -58,10 +61,12 @@ and the fix. Status: **done**, **in progress**, or **open**.
    `watch` channel) checked by the control loop, plus an optional
    `max_pages`.
 
-8. **Processing errors are swallowed.** `open`
-   `let _ = spider.process(item).await;` discards the error without even a
-   log line. Fix: log it at error level; later, count failures so `run` can
-   report them.
+8. **Processing errors are swallowed.** `done`
+   `let _ = spider.process(item).await;` discarded the error without even a
+   log line. Now logged with the spider's name and counted in `CrawlStats`
+   (item 3), alongside scrape failures. The remaining `let _ =` discards on
+   channel sends carry a comment saying why they are safe. Covered by
+   `run_counts_scrape_and_process_failures_instead_of_hiding_them`.
 
 9. **Delay is per slot, not per host.** `open` (roadmap: politeness)
    `sleep(delay)` inside each concurrency slot bounds throughput to
@@ -76,7 +81,8 @@ and the fix. Status: **done**, **in progress**, or **open**.
 
 11. **Spider names are listed twice.** `open`
     The `spiders` subcommand prints a hard-coded list; each spider also has a
-    `name()` that nothing calls (hence the dead-code warning). Fix: one
+    `name()` that until recently nothing called (it now prefixes the
+    scrape and process error logs). Fix: one
     registry of constructors keyed by `name()`, used by both subcommands.
 
 ## Errors (`error.rs`)

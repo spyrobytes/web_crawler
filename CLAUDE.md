@@ -105,7 +105,8 @@ bounded mpsc channels:
   closes, which can only mean the scraper task died. It then drops
   `urls_to_visit_tx`, which ends the scraper stream, which drops `items_tx`,
   which ends the processor stream. `run` awaits both join handles, always
-  both, and turns a `JoinError` into `Error::Internal`.
+  both, turns a `JoinError` into `Error::Internal`, and otherwise returns
+  the tallies each task carried back as `CrawlStats`.
 
 Consequences worth knowing before touching it:
 
@@ -123,8 +124,9 @@ Consequences worth knowing before touching it:
   join handle reports the panic, `run` returns an error), but spiders should
   still return `Error` rather than unwrap so one bad page costs one page, not
   the crawl.
-- Scrape errors are logged in `crawler.rs` and the URL is reported as visited
-  with no children. Returning an error from `scrape` therefore skips that page
+- Scrape and process errors are logged in `crawler.rs` with the spider's
+  name, counted in `CrawlStats`, and make `main` exit non-zero; a failed
+  scrape still reports its URL as visited with no children. Returning an error from `scrape` therefore skips that page
   and its pagination; the spiders instead skip individual bad rows inside
   `scrape` so pagination survives.
 - `main.rs` hard-codes the spider list for the `spiders` subcommand separately
