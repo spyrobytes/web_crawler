@@ -10,8 +10,9 @@ mod crawler;
 mod error;
 mod spiders;
 
-use crate::crawler::Crawler;
+use crate::crawler::{Crawler, StopReason};
 use error::Error;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -20,13 +21,21 @@ async fn main() -> Result<(), anyhow::Error> {
         .about(clap::crate_description!())
         .subcommand(Command::new("spiders").about("List all spiders"))
         .subcommand(
-            Command::new("run").about("Run a spider").arg(
-                Arg::new("spider")
-                    .short('s')
-                    .long("spider")
-                    .help("The spider to run")
-                    .required(true),
-            ),
+            Command::new("run")
+                .about("Run a spider")
+                .arg(
+                    Arg::new("spider")
+                        .short('s')
+                        .long("spider")
+                        .help("The spider to run")
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("max-pages")
+                        .long("max-pages")
+                        .value_parser(clap::value_parser!(usize))
+                        .help("Stop after handing out this many pages"),
+                ),
         )
         .arg_required_else_help(true)
         .get_matches();
@@ -45,7 +54,14 @@ async fn main() -> Result<(), anyhow::Error> {
             .get_one::<String>("spider")
             .expect("spider argument is required")
             .as_str();
-        let crawler = Crawler::new(Duration::from_millis(200), 2, 500);
+        let max_pages = matches.get_one::<usize>("max-pages").copied();
+
+        let cancellation = CancellationToken::new();
+        stop_on_ctrl_c(cancellation.clone());
+
+        let crawler = Crawler::new(Duration::from_millis(200), 2, 500)
+            .with_max_pages(max_pages)
+            .with_cancellation(cancellation);
 
         let stats = match spider_name {
             "cvedetails" => {
@@ -64,6 +80,13 @@ async fn main() -> Result<(), anyhow::Error> {
             _ => return Err(Error::InvalidSpider(spider_name.to_string()).into()),
         };
 
+        // A cancelled crawl shut down cleanly, but it did not finish. Exit
+        // with the conventional status for "interrupted" so a supervisor
+        // can tell the two apart.
+        if stats.stop_reason == Some(StopReason::Cancelled) {
+            std::process::exit(130);
+        }
+
         // The crawl itself ran to completion; whether it counts as a success
         // is the caller's call. For an unattended run, anything lost along
         // the way should show up in the exit code, not just in the log.
@@ -73,4 +96,23 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     Ok(())
+}
+
+// Turn Ctrl-C into a graceful stop. Once tokio has installed its handler the
+// default "kill the process" behaviour is gone, so a second Ctrl-C has to be
+// handled here too, otherwise a user whose first press seems to do nothing
+// has no way out.
+fn stop_on_ctrl_c(cancellation: CancellationToken) {
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_err() {
+            return;
+        }
+        log::warn!("ctrl-c: stopping after in-flight pages (press again to abort)");
+        cancellation.cancel();
+
+        if tokio::signal::ctrl_c().await.is_ok() {
+            log::error!("ctrl-c: aborting");
+            std::process::exit(130);
+        }
+    });
 }

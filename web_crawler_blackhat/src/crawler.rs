@@ -15,6 +15,7 @@ use tokio::{
     task::{JoinError, JoinHandle},
     time::sleep,
 };
+use tokio_util::sync::CancellationToken;
 
 /// What a finished crawl did, and what went wrong along the way.
 ///
@@ -22,8 +23,31 @@ use tokio::{
 /// crawler's own machinery failing (a task died); a page that could not be
 /// scraped or an item that could not be processed is counted here instead,
 /// so that nothing fails silently and the caller decides how strict to be.
+/// Why a crawl stopped before its frontier was empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// The cancellation token was triggered (for example by Ctrl-C).
+    Cancelled,
+    /// The configured `max_pages` was reached with URLs still waiting.
+    PageLimit,
+}
+
+impl fmt::Display for StopReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StopReason::Cancelled => write!(f, "cancelled"),
+            StopReason::PageLimit => write!(f, "page limit reached"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CrawlStats {
+    /// Set when the crawl stopped early; `None` means the frontier ran dry.
+    pub stop_reason: Option<StopReason>,
+    /// URLs that were discovered but never handed out (non-zero only when
+    /// the crawl stopped early).
+    pub frontier_remaining: usize,
     /// Pages whose `scrape` returned `Ok`.
     pub pages_scraped: usize,
     /// Pages whose `scrape` returned `Err` (logged at the time).
@@ -46,7 +70,15 @@ impl fmt::Display for CrawlStats {
             f,
             "pages scraped: {}, scrape errors: {}, items processed: {}, processing errors: {}",
             self.pages_scraped, self.scrape_errors, self.items_processed, self.process_errors
-        )
+        )?;
+        if let Some(reason) = self.stop_reason {
+            write!(
+                f,
+                " (stopped early: {reason}, {} urls left in the frontier)",
+                self.frontier_remaining
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -70,6 +102,8 @@ pub struct Crawler {
     delay: Duration,
     crawling_concurrency: usize,
     processing_concurrency: usize,
+    max_pages: Option<usize>,
+    cancellation: CancellationToken,
 }
 
 impl Crawler {
@@ -82,7 +116,26 @@ impl Crawler {
             delay,
             crawling_concurrency,
             processing_concurrency,
+            max_pages: None,
+            // A token nobody else holds can never be cancelled, so the
+            // default is "run until the frontier is empty".
+            cancellation: CancellationToken::new(),
         }
+    }
+
+    /// Stop handing out URLs once this many have been dispatched. In-flight
+    /// pages still finish and their items are still processed.
+    pub fn with_max_pages(mut self, max_pages: Option<usize>) -> Self {
+        self.max_pages = max_pages;
+        self
+    }
+
+    /// Cancelling this token asks the crawl to stop: nothing new is handed
+    /// out, in-flight pages finish, and `run` returns with
+    /// `StopReason::Cancelled`.
+    pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
     }
 
     pub async fn run<T: Send + 'static>(
@@ -109,6 +162,8 @@ impl Crawler {
         let mut visited_urls = HashSet::<String>::new();
         let mut frontier = VecDeque::<String>::new();
         let mut outstanding: usize = 0;
+        let mut dispatched: usize = 0;
+        let mut stop_reason: Option<StopReason> = None;
 
         for url in spider.start_urls() {
             if visited_urls.insert(url.clone()) {
@@ -144,8 +199,22 @@ impl Crawler {
         // their report arrives, so "frontier empty and nothing outstanding"
         // is exactly "no work anywhere", with no gap for a URL to hide in
         // between leaving the channel and being picked up by a scraper.
+        //
+        // Stopping early, whether by page budget or by cancellation, is just
+        // "behave as if the frontier were empty": stop handing URLs out, keep
+        // taking reports until nothing is outstanding, then shut down the
+        // normal way. In-flight pages finish and their items are processed.
         loop {
-            if frontier.is_empty() && outstanding == 0 {
+            let page_limit_hit = self.max_pages.is_some_and(|max| dispatched >= max);
+            if stop_reason.is_none() && page_limit_hit && !frontier.is_empty() {
+                log::info!(
+                    "crawler: page limit of {dispatched} reached, {} urls left in the frontier",
+                    frontier.len()
+                );
+                stop_reason = Some(StopReason::PageLimit);
+            }
+
+            if (frontier.is_empty() || stop_reason.is_some()) && outstanding == 0 {
                 break;
             }
 
@@ -174,7 +243,9 @@ impl Crawler {
 
                 // Only ask for room when there is something to send, otherwise
                 // this branch would hold a permit for nothing.
-                permit = urls_to_visit_tx.reserve(), if !frontier.is_empty() => {
+                // The `if stop_reason.is_none()` guard is what makes "stopping"
+                // mean "stop dispatching".
+                permit = urls_to_visit_tx.reserve(), if !frontier.is_empty() && stop_reason.is_none() => {
                     let Ok(permit) = permit else {
                         // The receiver is gone: same situation as above.
                         log::error!(
@@ -185,7 +256,20 @@ impl Crawler {
 
                     let url = frontier.pop_front().expect("branch is guarded by !is_empty");
                     outstanding += 1;
+                    dispatched += 1;
                     permit.send(url);
+                }
+
+                // Once a token is cancelled, `cancelled()` is ready forever.
+                // Without the guard this branch would win every turn and the
+                // loop would spin at full CPU while waiting for the last
+                // reports. A permanently-ready future inside a `select!` loop
+                // always needs a guard like this.
+                _ = self.cancellation.cancelled(), if stop_reason.is_none() => {
+                    log::warn!(
+                        "crawler: stop requested, waiting for {outstanding} in-flight pages"
+                    );
+                    stop_reason = Some(StopReason::Cancelled);
                 }
             }
         }
@@ -211,6 +295,8 @@ impl Crawler {
         let (scraper_tally, processor_tally) = (scrapers?, processors?);
 
         let stats = CrawlStats {
+            stop_reason,
+            frontier_remaining: frontier.len(),
             pages_scraped: scraper_tally.pages_scraped.into_inner(),
             scrape_errors: scraper_tally.scrape_errors.into_inner(),
             items_processed: processor_tally.items_processed.into_inner(),
@@ -427,6 +513,7 @@ mod tests {
                 scrape_errors: 0,
                 items_processed: 5,
                 process_errors: 0,
+                ..Default::default()
             }
         );
         assert!(!stats.has_failures());
@@ -492,6 +579,7 @@ mod tests {
                 scrape_errors: 1,
                 items_processed: 3,
                 process_errors: 2,
+                ..Default::default()
             }
         );
         assert!(stats.has_failures());
@@ -579,5 +667,115 @@ mod tests {
             .expect("a well-behaved spider should not produce an error");
 
         assert_eq!(spider.scraped.load(Ordering::SeqCst), 1_701);
+    }
+
+    // A frontier that never runs dry: every page links to the next one and
+    // yields one item.
+    struct EndlessSpider;
+
+    #[async_trait]
+    impl Spider for EndlessSpider {
+        type Item = usize;
+
+        fn name(&self) -> String {
+            String::from("endless")
+        }
+
+        fn start_urls(&self) -> Vec<String> {
+            vec![String::from("page-0")]
+        }
+
+        async fn scrape(&self, url: String) -> Result<(Vec<usize>, Vec<String>), Error> {
+            let n: usize = url
+                .trim_start_matches("page-")
+                .parse()
+                .map_err(|_| Error::Internal(format!("bad test url {url}")))?;
+            Ok((vec![n], vec![format!("page-{}", n + 1)]))
+        }
+
+        async fn process(&self, _item: usize) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_stops_at_the_page_limit() {
+        let spider: Arc<dyn Spider<Item = usize>> = Arc::new(EndlessSpider);
+        let crawler = Crawler::new(Duration::from_millis(0), 2, 1).with_max_pages(Some(10));
+
+        let stats = tokio::time::timeout(Duration::from_secs(2), crawler.run(spider))
+            .await
+            .expect("the page limit should end an endless crawl")
+            .expect("a page limit is not a failure");
+
+        assert_eq!(stats.stop_reason, Some(StopReason::PageLimit));
+        assert_eq!(stats.pages_scraped, 10);
+        assert_eq!(stats.items_processed, 10);
+        assert_eq!(stats.frontier_remaining, 1);
+        assert!(!stats.has_failures());
+    }
+
+    // The edge that would otherwise hang: a limit of zero must stop before
+    // the first dispatch, not wait for a report that never comes.
+    #[tokio::test]
+    async fn run_with_a_zero_page_limit_returns_immediately() {
+        let spider: Arc<dyn Spider<Item = usize>> = Arc::new(EndlessSpider);
+        let crawler = Crawler::new(Duration::from_millis(0), 2, 1).with_max_pages(Some(0));
+
+        let stats = tokio::time::timeout(Duration::from_secs(2), crawler.run(spider))
+            .await
+            .expect("crawler should finish")
+            .expect("a page limit is not a failure");
+
+        assert_eq!(stats.stop_reason, Some(StopReason::PageLimit));
+        assert_eq!(stats.pages_scraped, 0);
+        assert_eq!(stats.frontier_remaining, 1);
+    }
+
+    // A limit that is never reached must not be reported as a stop.
+    #[tokio::test]
+    async fn run_with_a_generous_page_limit_finishes_normally() {
+        let spider = Arc::new(CountingSpider {
+            scraped: AtomicUsize::new(0),
+            processed: AtomicUsize::new(0),
+        });
+        let dyn_spider: Arc<dyn Spider<Item = u32>> = spider.clone();
+        let crawler = Crawler::new(Duration::from_millis(0), 2, 1).with_max_pages(Some(100));
+
+        let stats = tokio::time::timeout(Duration::from_secs(2), crawler.run(dyn_spider))
+            .await
+            .expect("crawler should finish")
+            .expect("nothing fails here");
+
+        assert_eq!(stats.stop_reason, None);
+        assert_eq!(stats.pages_scraped, 2);
+    }
+
+    #[tokio::test]
+    async fn run_stops_when_cancelled_and_finishes_in_flight_pages() {
+        let spider: Arc<dyn Spider<Item = usize>> = Arc::new(EndlessSpider);
+        let token = CancellationToken::new();
+        // a small delay per page so the crawl is still going when we cancel
+        let crawler = Crawler::new(Duration::from_millis(1), 2, 1).with_cancellation(token.clone());
+
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(50)).await;
+            token.cancel();
+        });
+
+        let stats = tokio::time::timeout(Duration::from_secs(2), crawler.run(spider))
+            .await
+            .expect("cancellation should end an endless crawl")
+            .expect("cancellation is not a failure");
+
+        assert_eq!(stats.stop_reason, Some(StopReason::Cancelled));
+        assert!(
+            stats.pages_scraped > 0,
+            "the crawl should have made progress"
+        );
+        // every page handed out was reported and its item processed: the loop
+        // waited for in-flight work instead of abandoning it
+        assert_eq!(stats.items_processed, stats.pages_scraped);
+        assert!(!stats.has_failures());
     }
 }
