@@ -1,3 +1,4 @@
+use crate::error::Error;
 use crate::spiders::Spider;
 use futures::stream::StreamExt;
 use std::{
@@ -9,7 +10,8 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{mpsc, Barrier},
+    sync::mpsc,
+    task::{JoinError, JoinHandle},
     time::sleep,
 };
 
@@ -55,7 +57,10 @@ impl Crawler {
         }
     }
 
-    pub async fn run<T: Send + 'static>(&self, spider: Arc<dyn Spider<Item = T>>) {
+    pub async fn run<T: Send + 'static>(
+        &self,
+        spider: Arc<dyn Spider<Item = T>>,
+    ) -> Result<(), Error> {
         let mut visited_urls = HashSet::<String>::new();
         let crawling_concurrency = self.crawling_concurrency;
         let crawling_queue_capacity = crawling_concurrency * 400;
@@ -68,21 +73,15 @@ impl Crawler {
         let (urls_to_visit_tx, urls_to_visit_rx) = mpsc::channel(crawling_queue_capacity);
         let (items_tx, items_rx) = mpsc::channel(processing_queue_capacity);
         let (new_urls_tx, mut new_urls_rx) = mpsc::channel(crawling_queue_capacity);
-        let barrier = Arc::new(Barrier::new(3));
 
         for url in spider.start_urls() {
             visited_urls.insert(url.clone());
             let _ = urls_to_visit_tx.send(url).await;
         }
 
-        self.launch_processors(
-            processing_concurrency,
-            spider.clone(),
-            items_rx,
-            barrier.clone(),
-        );
+        let processors = self.launch_processors(processing_concurrency, spider.clone(), items_rx);
 
-        self.launch_scrapers(
+        let scrapers = self.launch_scrapers(
             crawling_concurrency,
             spider.clone(),
             urls_to_visit_rx,
@@ -90,7 +89,6 @@ impl Crawler {
             items_tx,
             active_spiders.clone(),
             self.delay,
-            barrier.clone(),
         );
 
         // The Control Loop
@@ -122,34 +120,42 @@ impl Crawler {
 
         log::info!("crawler: control loop exited");
 
-        // we drop the transmitter in order to close the stream
-        // and thus stop the crawler
+        // Dropping the transmitter closes the stream of URLs, which ends the
+        // scraper task; the scraper task drops `items_tx` on its way out,
+        // which ends the processor task. That chain is the shutdown order.
         drop(urls_to_visit_tx);
 
-        // and then we wait for the streams to complete
-        barrier.wait().await;
+        // Wait for the tasks by awaiting their join handles rather than a
+        // barrier. A barrier is a rendezvous: it only works if every party
+        // arrives, and a task that panicked never does. A `JoinHandle`
+        // resolves either way, and tells us when the task died.
+        //
+        // Both handles are awaited before returning, even if the first one
+        // failed, so processing always drains before `run` returns.
+        let scrapers = scrapers.await.map_err(|err| task_failure("scraper", err));
+        let processors = processors
+            .await
+            .map_err(|err| task_failure("processor", err));
+
+        scrapers.and(processors)
     }
 
     // Launching the processors is a matter of spawning a new task with a
-    // stream and for_each_concurrent. Once the stream is stopped, we "notify"
-    // the barrier.
+    // stream and for_each_concurrent. The task ends when the stream ends, and
+    // the caller learns about it through the returned join handle.
     fn launch_processors<T: Send + 'static>(
         &self,
         concurrency: usize,
         spider: Arc<dyn Spider<Item = T>>,
         items: mpsc::Receiver<T>,
-        barrier: Arc<Barrier>,
-    ) {
+    ) -> JoinHandle<()> {
         tokio::spawn(async move {
             tokio_stream::wrappers::ReceiverStream::new(items)
                 .for_each_concurrent(concurrency, |item| async {
                     let _ = spider.process(item).await;
                 })
                 .await;
-
-            // wait for all tasks to rendezvous
-            barrier.wait().await;
-        });
+        })
     }
 
     // Launch the scrappers, much the same way as launching the processors.
@@ -166,8 +172,7 @@ impl Crawler {
         items_tx: mpsc::Sender<T>,
         active_spiders: Arc<AtomicUsize>,
         delay: Duration,
-        barrier: Arc<Barrier>,
-    ) {
+    ) -> JoinHandle<()> {
         tokio::spawn(async move {
             tokio_stream::wrappers::ReceiverStream::new(urls_to_visit)
                 .for_each_concurrent(concurrency, |queued_url| {
@@ -203,15 +208,20 @@ impl Crawler {
                 .await;
 
             drop(items_tx);
-            barrier.wait().await;
-        });
+        })
     }
+}
+
+// Turn a task that panicked (or was cancelled) into a crawler error, logging
+// it at the point where we learn about it.
+fn task_failure(task: &str, err: JoinError) -> Error {
+    log::error!("crawler: {task} task failed: {err}");
+    Error::Internal(format!("crawler: {task} task failed: {err}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::Error;
     use async_trait::async_trait;
 
     #[test]
@@ -294,20 +304,74 @@ mod tests {
         }
     }
 
-    // With the guard, the control loop now exits after a spider panics (the
-    // "control loop exited" log line appears). The run still does not return
-    // because the dead scraper task never reaches the three-party barrier.
-    // Un-ignore this once the barrier is replaced by awaiting join handles.
+    // The guard lets the control loop exit after the panic; awaiting the
+    // join handles (instead of a barrier the dead task never reaches) lets
+    // `run` return and report it.
     #[tokio::test]
-    #[ignore = "hangs at the barrier until shutdown awaits join handles"]
-    async fn run_returns_after_a_spider_panics() {
-        let _ = env_logger::builder().is_test(true).try_init();
-
+    async fn run_returns_an_error_after_a_spider_panics() {
         let crawler = Crawler::new(Duration::from_millis(0), 2, 1);
         let spider: Arc<dyn Spider<Item = ()>> = Arc::new(PanickingSpider);
 
-        tokio::time::timeout(Duration::from_secs(2), crawler.run(spider))
+        let result = tokio::time::timeout(Duration::from_secs(2), crawler.run(spider))
             .await
             .expect("crawler should return after a spider panics");
+
+        let err = result.expect_err("a dead scraper task should be reported");
+        assert!(err.to_string().contains("scraper task failed"), "{err}");
+    }
+
+    // A well-behaved spider: two pages, five items, and counters we can read
+    // back after the crawl.
+    struct CountingSpider {
+        scraped: AtomicUsize,
+        processed: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Spider for CountingSpider {
+        type Item = u32;
+
+        fn name(&self) -> String {
+            String::from("counting")
+        }
+
+        fn start_urls(&self) -> Vec<String> {
+            vec![String::from("page-1")]
+        }
+
+        async fn scrape(&self, url: String) -> Result<(Vec<u32>, Vec<String>), Error> {
+            self.scraped.fetch_add(1, Ordering::SeqCst);
+            match url.as_str() {
+                "page-1" => Ok((vec![1, 2, 3], vec![String::from("page-2")])),
+                // links back to page-1 to check the visited-set dedup
+                "page-2" => Ok((vec![4, 5], vec![String::from("page-1")])),
+                other => Err(Error::Internal(format!("unexpected url {other}"))),
+            }
+        }
+
+        async fn process(&self, _item: u32) -> Result<(), Error> {
+            self.processed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    // The property the barrier existed to protect: every item is processed
+    // before `run` returns. It must still hold without the barrier.
+    #[tokio::test]
+    async fn run_processes_every_item_before_returning() {
+        let spider = Arc::new(CountingSpider {
+            scraped: AtomicUsize::new(0),
+            processed: AtomicUsize::new(0),
+        });
+        let dyn_spider: Arc<dyn Spider<Item = u32>> = spider.clone();
+        let crawler = Crawler::new(Duration::from_millis(0), 2, 2);
+
+        tokio::time::timeout(Duration::from_secs(2), crawler.run(dyn_spider))
+            .await
+            .expect("crawler should finish")
+            .expect("a well-behaved spider should not produce an error");
+
+        assert_eq!(spider.scraped.load(Ordering::SeqCst), 2);
+        assert_eq!(spider.processed.load(Ordering::SeqCst), 5);
     }
 }

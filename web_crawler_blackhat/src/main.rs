@@ -1,9 +1,9 @@
 /**
  * Main entry point for the web crawler.
- * 
- * 
+ *
+ *
  */
-use clap::{Command, Arg};
+use clap::{Arg, Command};
 use std::{env, sync::Arc, time::Duration};
 
 mod crawler;
@@ -50,16 +50,16 @@ async fn main() -> Result<(), anyhow::Error> {
         match spider_name {
             "cvedetails" => {
                 let spider = Arc::new(spiders::cvedetails::CveDetailsSpider::new());
-                crawler.run(spider).await;
+                crawler.run(spider).await?;
             }
             "github" => {
                 let spider = Arc::new(spiders::github::GitHubSpider::new());
-                crawler.run(spider).await;
+                crawler.run(spider).await?;
             }
             "quotes" => {
                 let spider = spiders::quotes::QuotesSpider::new().await?;
                 let spider = Arc::new(spider);
-                crawler.run(spider).await;
+                crawler.run(spider).await?;
             }
             _ => return Err(Error::InvalidSpider(spider_name.to_string()).into()),
         };
